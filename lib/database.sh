@@ -107,11 +107,40 @@ db_unreadable_objects() {
   db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null
 }
 
+# Número de tablas de usuario en la base de datos
+db_table_count() {
+  local ocf="$1" ns="$2" pod="$3" role="${4:-app}"
+  db_psql_as "$ocf" "$ns" "$pod" "$role" \
+    "SELECT count(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema');" \
+    2>/dev/null | tr -d '[:space:]'
+}
+
+# Conteo EXACTO de filas por tabla, comparable entre clústeres.
+db_rowcounts() {
+  local ocf="$1" ns="$2" pod="$3" out="$4" role="${5:-app}" sql
+  sql="SELECT table_schema||'.'||table_name AS t,
+              (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS n
+       FROM information_schema.tables
+       WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema')
+       ORDER BY 1;"
+  db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null | sort > "$out" \
+    || warn "No se pudieron obtener los conteos de filas en $ns/$pod"
+}
+
 # ¿El rol conecta y puede leerlo todo?
 db_role_works() {
   local ocf="$1" ns="$2" pod="$3" role="$4"
   db_psql_as "$ocf" "$ns" "$pod" "$role" "SELECT 1;" >/dev/null 2>&1 || return 1
   [[ -z "$(db_unreadable_objects "$ocf" "$ns" "$pod" "$role")" ]]
+}
+
+# Rol de solo lectura para consultar el destino: el usuario de la aplicación si
+# le basta, y si no el superusuario por socket local. Sin ruido en el log.
+db_pick_read_role() {
+  local ocf="$1" ns="$2" pod="$3"
+  db_role_works "$ocf" "$ns" "$pod" app            && { printf 'app';            return 0; }
+  db_role_works "$ocf" "$ns" "$pod" postgres-local && { printf 'postgres-local'; return 0; }
+  printf 'app'
 }
 
 # Decide con qué rol volcar.
@@ -296,7 +325,8 @@ MSG
 
   # No se borra nada sin permiso explícito: si la BD de contingencia ya tiene
   # tablas, hay que decidir a mano.
-  local existing; existing=$(db_table_count oc_dst "$dst_ns" "$dst_pod")
+  local dst_role; dst_role=$(db_pick_read_role oc_dst "$dst_ns" "$dst_pod")
+  local existing; existing=$(db_table_count oc_dst "$dst_ns" "$dst_pod" "$dst_role")
   if [[ "${existing:-0}" -gt 0 && "${DB_RESTORE_CLEAN:-false}" != true ]]; then
     cat >&2 <<MSG
 
@@ -339,7 +369,7 @@ MSG
   set -e
   oc_dst exec -n "$dst_ns" "$dst_pod" -- rm -rf "$DB_REMOTE_DIR" >/dev/null 2>&1 || true
 
-  local errs; errs=$(grep -ci '^pg_restore: error' "$RUN/db/restore.log" 2>/dev/null || echo 0)
+  local errs; errs=$(grep -ci '^pg_restore: error' "$RUN/db/restore.log" 2>/dev/null) || errs=0
   if (( rc != 0 || errs > 0 )); then
     # Con --clean son habituales los errores por objetos inexistentes o por no ser
     # dueño de extensiones del sistema; el juez final es el diff de conteos.
@@ -351,7 +381,7 @@ MSG
 
   # ======================= verificación =======================
   log "  conteo de filas en destino"
-  db_rowcounts oc_dst "$dst_ns" "$dst_pod" "$RUN/db/rowcounts-dst.txt"
+  db_rowcounts oc_dst "$dst_ns" "$dst_pod" "$RUN/db/rowcounts-dst.txt" "$dst_role"
 
   if diff -u "$RUN/db/rowcounts-src.txt" "$RUN/db/rowcounts-dst.txt" > "$RUN/db/rowcounts.diff" 2>&1; then
     ok "Conteo de filas idéntico en origen y destino ($(wc -l < "$RUN/db/rowcounts-dst.txt") tablas)"

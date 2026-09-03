@@ -444,6 +444,21 @@ Queda registrado en `reports/manual-todo.txt`:
 
 ---
 
+## Pruebas
+
+`tests/smoke.sh` ejecuta el flujo completo contra un `oc` simulado, sin tocar
+ningún clúster. Cubre lo que `bash -n` no ve: funciones invocadas pero no
+definidas, y errores que solo aparecen al ejecutar una fase entera.
+
+```bash
+bash tests/smoke.sh        # exit 0 si todo pasa
+```
+
+Comprueba sintaxis, que todas las funciones invocadas existen, el pipeline con
+manifiestos YAML y JSON, `db-migrate` de extremo a extremo (incluida la escalada
+al superusuario por socket local) y que el guardarraíl rechaza los verbos de
+escritura sobre producción.
+
 ## Estructura
 
 ```
@@ -451,6 +466,7 @@ sanba-dr-migrate.sh      orquestador
 sanba-dr.env             parámetros
 route-map.txt            mapeo opcional de hosts custom
 lib/                     common, preflight, export, transform, images, apply, database, validate
+tests/                   smoke.sh, mock-oc y fixtures.py (pruebas sin clúster)
 out/<run>/
   raw/                   objetos crudos de producción
   clean/                 manifiestos listos para aplicar
