@@ -47,7 +47,7 @@ mask() {
 #    get, describe, logs, version, whoami, auth, api-resources, explain,
 #    project(s), status, exec, rsh, rsync, cp
 # ===========================================================================
-_OC_SRC_VERBS=" get describe exec rsh rsync cp logs version whoami auth api-resources api-versions explain project projects status "
+_OC_SRC_VERBS=" get describe exec rsh rsync cp logs version whoami auth api-resources api-versions explain project projects status registry "
 
 # Devuelve los argumentos posicionales de una línea de oc (verbo y operandos),
 # saltando las opciones globales y sus valores. Hace falta porque el verbo no

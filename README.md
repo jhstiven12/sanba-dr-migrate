@@ -202,9 +202,15 @@ less out/<run>/mirror-commands.sh    # los skopeo copy, para revisarlos
 ./sanba-dr-migrate.sh mirror         # los ejecuta y verifica el digest resultante
 ```
 
-`mirror` se autentica en ambos registries con los tokens de tus sesiones de `oc`
-y, tras copiar, compara el digest del destino con el del origen: si no coincide,
-lo marca como fallo. Necesita que los registries internos tengan su ruta
+`mirror` se autentica con `oc registry login`, que registra el token de cada
+kubeconfig como credencial del registry correspondiente —así no hay que adivinar
+el nombre de usuario (`kube:admin`, un service account…), que es la causa
+habitual de los fallos de autenticación—. Tras copiar, compara el digest del
+destino con el del origen: si no coincide, lo marca como fallo.
+
+Si la autenticación falla, el script muestra el error real de `oc` y, según lo
+que diga, te indica qué hacer: confiar en la CA del router, `MIRROR_TLS_VERIFY`,
+renovar el token o revisar DNS y proxy. Necesita que los registries internos tengan su ruta
 expuesta; si no la tienen, el `export` te avisa y te da el comando
 ([Registry 4.18 → Exposing the registry](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/registry/securing-exposing-registry)).
 Si sus certificados los firma la CA del clúster y tu host no la reconoce, pon

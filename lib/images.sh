@@ -164,9 +164,12 @@ generate_mirror_script() {
     echo '# producción. "skopeo copy --all" conserva el manifiesto y el digest.'
     echo 'set -euo pipefail'
     echo
-    echo "# Autenticación (los tokens salen de tus sesiones de oc):"
-    echo "#   skopeo login -u \$(KUBECONFIG=\"\$KUBECONFIG_SRC\" oc whoami) -p \$(KUBECONFIG=\"\$KUBECONFIG_SRC\" oc whoami -t) ${reg_src:-<ruta-registry-produccion>}"
-    echo "#   skopeo login -u \$(KUBECONFIG=\"\$KUBECONFIG_DST\" oc whoami) -p \$(KUBECONFIG=\"\$KUBECONFIG_DST\" oc whoami -t) ${reg_dst:-<ruta-registry-preproduccion>}"
+    echo "# Autenticación previa (usa el token de cada kubeconfig; no hay que"
+    echo "# adivinar el nombre de usuario):"
+    echo "#   KUBECONFIG=\"\$KUBECONFIG_SRC\" oc registry login --registry ${reg_src:-<registry-produccion>} --to /tmp/auth-src.json"
+    echo "#   KUBECONFIG=\"\$KUBECONFIG_DST\" oc registry login --registry ${reg_dst:-<registry-preproduccion>} --to /tmp/auth-dst.json"
+    echo "# y añade a cada skopeo copy:"
+    echo "#   --src-authfile /tmp/auth-src.json --dest-authfile /tmp/auth-dst.json"
     echo
   } > "$mirror"
 
@@ -233,6 +236,84 @@ tf_rewrite_images() {
 # ---------------------------------------------------------------------------
 # Ejecución del mirror
 # ---------------------------------------------------------------------------
+# Autentica contra un registry y, si falla, explica por qué en lugar de esconderlo.
+registry_auth() {
+  local ocf="$1" registry="$2" authfile="$3" label="$4"
+  local insec="" kc
+  [[ "${MIRROR_TLS_VERIFY:-true}" == false ]] && insec="--insecure"
+  [[ "$label" == "PRODUCCIÓN" ]] && kc='$KUBECONFIG_SRC' || kc='$KUBECONFIG_DST'
+
+  if "$ocf" registry login --registry "$registry" --to "$authfile" $insec \
+       > "$RUN/.login.err" 2>&1; then
+    ok "Autenticado en el registry de $label"
+    rm -f "$RUN/.login.err"; return 0
+  fi
+
+  # La comprobación contra el registry puede fallar aunque las credenciales sean
+  # correctas (proxy, red intermedia). Se reintenta guardándolas sin verificar.
+  if "$ocf" registry login --registry "$registry" --to "$authfile" $insec --skip-check \
+       >> "$RUN/.login.err" 2>&1; then
+    warn "Credenciales guardadas para $label, pero la comprobación contra el registry falló"
+    log  "  Si el mirror falla luego, la causa está en $RUN/.login.err"
+    return 0
+  fi
+
+  err "No se pudo autenticar en el registry de $label ($registry)"
+  sed 's/^/      /' "$RUN/.login.err" >&2
+
+  if grep -qiE 'x509|certificate|tls' "$RUN/.login.err"; then
+    cat >&2 <<MSG
+
+  Es un problema de certificado: el registry usa uno firmado por la CA del
+  clúster y este host no la reconoce. Dos salidas:
+
+   a) Confiar en esa CA (lo correcto):
+        KUBECONFIG="$kc" oc get secret -n openshift-ingress-operator router-ca \\
+          -o jsonpath='{.data.tls\\.crt}' | base64 -d \\
+          | sudo tee /etc/pki/ca-trust/source/anchors/ocp-router-ca.crt
+        sudo update-ca-trust extract
+
+   b) Saltarse la verificación, en sanba-dr.env:
+        MIRROR_TLS_VERIFY="false"
+
+MSG
+  elif grep -qiE 'unauthorized|forbidden|401|403' "$RUN/.login.err"; then
+    cat >&2 <<MSG
+
+  El token sirve para la API pero el registry lo rechaza. Comprueba que la
+  sesión sigue viva y que tienes acceso al registry:
+
+      KUBECONFIG="$kc" oc whoami
+      KUBECONFIG="$kc" oc auth can-i get imagestreams --all-namespaces
+
+  Si la sesión caducó, repite el 'oc login' con un token nuevo.
+
+MSG
+  elif grep -qiE 'no such host|timeout|connection refused|dial tcp|i/o timeout' "$RUN/.login.err"; then
+    cat >&2 <<MSG
+
+  No hay conectividad con $registry desde este host:
+
+      getent hosts $registry
+      curl -sk -o /dev/null -w '%{http_code}\\n' https://$registry/v2/
+
+  Si es un entorno con proxy, exporta HTTPS_PROXY y NO_PROXY antes de ejecutar.
+
+MSG
+  elif grep -qiE 'client certificate|unable to find|image stream' "$RUN/.login.err"; then
+    cat >&2 <<MSG
+
+  'oc registry login' no ha podido determinar las credenciales. Suele pasar si
+  la sesión se abrió con certificado de cliente en vez de con token. Vuelve a
+  entrar con token:
+
+      KUBECONFIG="$kc" oc login <api> --token=sha256~...
+
+MSG
+  fi
+  return 1
+}
+
 cmd_mirror() {
   require_cmd oc jq skopeo
   [[ -s "$RUN/image-map.tsv" ]] \
@@ -264,15 +345,21 @@ cmd_mirror() {
     return 0
   fi
 
-  # Autenticación con los tokens de las sesiones de oc ya abiertas
-  local u t
-  u=$(oc_src whoami 2>/dev/null); t=$(oc_src whoami -t 2>/dev/null)
-  skopeo login -u "$u" -p "$t" ${tlsflags:+--tls-verify=false} "$reg_src" >/dev/null 2>&1 \
-    || die "No se pudo autenticar contra el registry de producción ($reg_src)"
-  u=$(oc_dst whoami 2>/dev/null); t=$(oc_dst whoami -t 2>/dev/null)
-  skopeo login -u "$u" -p "$t" ${tlsflags:+--tls-verify=false} "$reg_dst" >/dev/null 2>&1 \
-    || die "No se pudo autenticar contra el registry de pre-producción ($reg_dst)"
-  ok "Autenticado en ambos registries"
+  # Autenticación. 'oc registry login' registra el token del kubeconfig como
+  # credencial del registry indicado, sin tener que adivinar el nombre de
+  # usuario (kube:admin, un service account...).
+  local auth_src="$RUN/.auth-src.json" auth_dst="$RUN/.auth-dst.json"
+  registry_auth oc_src "$reg_src" "$auth_src" "PRODUCCIÓN"     || return 1
+  registry_auth oc_dst "$reg_dst" "$auth_dst" "PRE-PRODUCCIÓN" || return 1
+
+  # Para empujar a un namespace hace falta system:image-builder o equivalente.
+  local ns_dr
+  for ns_dr in $(awk -F'\t' '$7=="si" {print $1}' "$RUN/image-map.tsv" | sort -u); do
+    if [[ "$(oc_dst auth can-i create imagestreams -n "$ns_dr" 2>/dev/null)" != "yes" ]]; then
+      warn "$ns_dr: puede que no tengas permiso para empujar imágenes"
+      todo "$ns_dr: concede escritura en el registry: oc -n $ns_dr policy add-role-to-user system:image-builder <usuario>"
+    fi
+  done
 
   local d workload container src dst tag src_ext dst_ext repo digest got
   local copiadas=0 fallidas=0 verificadas=0
@@ -285,11 +372,12 @@ cmd_mirror() {
 
     log "  $d $workload/$container"
     if skopeo copy --all --retry-times 3 $tlsflags \
+         --src-authfile "$auth_src" --dest-authfile "$auth_dst" \
          "docker://${src_ext}" "docker://${dst_ext}" >/dev/null 2>"$RUN/.skopeo.err"; then
       copiadas=$((copiadas+1))
       # La prueba de que es "tal cual": el digest del destino debe coincidir.
       if [[ "$src" == *@sha256:* ]]; then
-        got=$(skopeo inspect --raw $tlsflags "docker://${dst_ext}" 2>/dev/null \
+        got=$(skopeo inspect --raw $tlsflags --authfile "$auth_dst" "docker://${dst_ext}" 2>/dev/null \
               | sha256sum | awk '{print "sha256:"$1}')
         if [[ "$got" == "$digest" ]]; then
           ok "  digest verificado: $digest"
@@ -306,7 +394,7 @@ cmd_mirror() {
       todo "$d/$workload contenedor '$container': falló el mirror de $src_ext"
     fi
   done < "$RUN/image-map.tsv"
-  rm -f "$RUN/.skopeo.err"
+  rm -f "$RUN/.skopeo.err" "$auth_src" "$auth_dst"
 
   step "Mirror terminado"
   log "  copiadas: $copiadas    con digest verificado: $verificadas    fallidas: $fallidas"
