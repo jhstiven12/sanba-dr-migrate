@@ -356,7 +356,15 @@ puede leer el rol y actúa según el caso.
   GRANT SELECT ON ALL SEQUENCES IN SCHEMA <esquema> TO <usuario_app>;
   ```
 
-Con `DB_DUMP_ROLE` puedes forzar el rol: `auto` (por defecto), `app` o `postgres`.
+En `auto` (por defecto) se prueban por orden: usuario de la aplicación →
+superusuario con la contraseña que el pod tenga en su entorno → superusuario por
+el **socket local del pod, sin contraseña**. Este último suele funcionar en las
+imágenes de PostgreSQL de Red Hat: por eso traen `PGUSER=postgres` en el entorno.
+Con `DB_DUMP_ROLE` puedes forzarlo: `app`, `postgres` o `postgres-local`.
+
+> `DB_ADMIN_PASSWORD_ENV` es el **nombre** de una variable de entorno del pod,
+> nunca una contraseña. El script rechaza valores que no parezcan un nombre de
+> variable, porque un secreto ahí acabaría en `sanba-dr.env` y en `migrate.log`.
 
 ### RoleBindings que no se migran
 

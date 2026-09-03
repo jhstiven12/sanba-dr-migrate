@@ -26,7 +26,9 @@ step() { printf '\n%s %s\n'  "${C_BLU}==>${C_RST}"      "$*" >&2; }
 ok()   { printf '  %s %s\n'  "${C_GRN}OK${C_RST}"       "$*" >&2; }
 warn() { printf '  %s %s\n'  "${C_YEL}WARN${C_RST}"     "$*" >&2; WARN_COUNT=$((WARN_COUNT+1)); }
 err()  { printf '  %s %s\n'  "${C_RED}FAIL${C_RST}"     "$*" >&2; FAIL_COUNT=$((FAIL_COUNT+1)); }
-die()  { printf '\n%s %s\n\n' "${C_RED}ABORTA:${C_RST}" "$*" >&2; exit 1; }
+# Aborta con un mensaje propio. Marca _SANBA_DIED para que el trap de ERR no
+# añada encima una traza de "comando fallido": el motivo ya se ha explicado.
+die()  { _SANBA_DIED=1; printf '\n%s %s\n\n' "${C_RED}ABORTA:${C_RST}" "$*" >&2; exit 1; }
 
 # Enmascara credenciales en cualquier texto que vaya al log.
 mask() {

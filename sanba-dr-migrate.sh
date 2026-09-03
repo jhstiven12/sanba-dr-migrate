@@ -120,8 +120,10 @@ done
 # JSON (RHEL 9 sin yq). Todo el resto del script respeta $MANIFEST_EXT.
 detect_manifest_format
 
-trap 'rc=$?; [[ $rc -ne 0 ]] && printf "\n%s comando fallido (rc=%s) en %s:%s\n" \
-      "${C_RED:-}ERROR${C_RST:-}" "$rc" "${BASH_SOURCE[0]}" "$LINENO" >&2; exit $rc' ERR
+trap 'rc=$?; if [[ $rc -ne 0 && -z "${_SANBA_DIED:-}" ]]; then
+        printf "\n%s comando fallido (rc=%s) en %s:%s\n" \
+          "${C_RED:-}ERROR${C_RST:-}" "$rc" "${BASH_SOURCE[0]}" "$LINENO" >&2
+      fi; exit $rc' ERR
 
 # =============================================================================
 #  rollback

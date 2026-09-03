@@ -523,9 +523,18 @@ tf_routes() {
 
       if [[ -z "$newhost" ]]; then
         todo "$d/$name: host custom sin mapeo; el router asignará uno. Revisa DNS/certificado."
-      elif [[ ${#newhost} -gt 63 ]]; then
-        warn "$d/$name: el host generado tiene ${#newhost} caracteres (>63), el router puede rechazarlo"
-        todo "$d/$name: acorta el nombre de la Route o define un host en $ROUTE_MAP_FILE"
+      else
+        # DNS limita cada etiqueta a 63 caracteres y el nombre completo a 253.
+        # El límite NO es sobre la longitud total del host.
+        local longest
+        longest=$(tr '.' '\n' <<< "$newhost" | awk '{ if (length > m) m = length } END { print m+0 }')
+        if [[ "$longest" -gt 63 ]]; then
+          warn "$d/$name: el host generado tiene una etiqueta de $longest caracteres (>63); el router la rechazará"
+          todo "$d/$name: acorta el nombre de la Route o define un host en $ROUTE_MAP_FILE"
+        elif [[ ${#newhost} -gt 253 ]]; then
+          warn "$d/$name: el host generado tiene ${#newhost} caracteres (>253)"
+          todo "$d/$name: host demasiado largo; define uno más corto en $ROUTE_MAP_FILE"
+        fi
       fi
       if [[ "$term" == "reencrypt" && "$ROUTE_TLS_STRATEGY" == "default" ]]; then
         todo "$d/$name: era reencrypt; se quitó destinationCACertificate (era del service-CA de PROD). Verifica el backend TLS."

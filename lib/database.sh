@@ -35,6 +35,24 @@ db_find_pod() {
 db_creds() {
   local ocf="$1" ns="$2" pod="$3" raw
   local admvar="${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}"
+
+  # DB_ADMIN_PASSWORD_ENV es el NOMBRE de una variable de entorno del pod, nunca
+  # una contraseña. Las variables de entorno son MAYUSCULAS_CON_GUION_BAJO; si no
+  # lo parece, casi seguro que alguien ha pegado ahí un secreto.
+  if [[ ! "$admvar" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+    cat >&2 <<MSG
+
+  DB_ADMIN_PASSWORD_ENV tiene un valor que no parece el nombre de una variable
+  de entorno. Ese parámetro espera el NOMBRE de la variable que el pod ya
+  contiene (por ejemplo POSTGRESQL_ADMIN_PASSWORD), no la contraseña.
+
+  Si has escrito ahí una contraseña, cámbiala: ha quedado en sanba-dr.env y
+  puede haber quedado en out/*/migrate.log. Para localizarla:
+      grep -rl 'DB_ADMIN_PASSWORD_ENV' sanba-dr.env out/*/migrate.log
+
+MSG
+    die "DB_ADMIN_PASSWORD_ENV debe ser un nombre de variable, no un valor."
+  fi
   # La contraseña se resuelve DENTRO del pod: nunca aparece en la línea de
   # comandos del cliente ni en la lista de procesos de este host.
   raw=$("$ocf" -n "$ns" exec "$pod" -- bash -c \
@@ -43,10 +61,11 @@ db_creds() {
   IFS=$'\037' read -r PGU PGP PGD PGADMIN <<< "$raw"
   [[ -n "${PGU:-}" && -n "${PGD:-}" ]] \
     || die "El pod $ns/$pod no expone POSTGRESQL_USER/POSTGRESQL_DATABASE. Indica el pod correcto con DB_SELECTOR."
+  # Nunca se registra el valor de $admvar: solo si existe o no.
   if [[ -n "${PGADMIN:-}" ]]; then
-    log "  pod=$pod  usuario=$PGU  base=$PGD  (superusuario '${DB_ADMIN_USER:-postgres}' disponible via \$$admvar)"
+    log "  pod=$pod  usuario=$PGU  base=$PGD  (el pod expone la contraseña de '${DB_ADMIN_USER:-postgres}')"
   else
-    log "  pod=$pod  usuario=$PGU  base=$PGD  (el pod no expone \$$admvar)"
+    log "  pod=$pod  usuario=$PGU  base=$PGD  (el pod no expone contraseña de superusuario)"
   fi
 }
 
@@ -58,6 +77,12 @@ db_psql_as() {
   if [[ "$role" == postgres ]]; then
     "$ocf" -n "$ns" exec "$pod" -- bash -c \
       "PGPASSWORD=\"\$${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}\" psql -U ${DB_ADMIN_USER:-postgres} -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
+  elif [[ "$role" == postgres-local ]]; then
+    # Socket local del contenedor: las imágenes de PostgreSQL de Red Hat suelen
+    # permitir al superusuario conectarse sin contraseña desde dentro del pod
+    # (de ahí el PGUSER=postgres que traen en el entorno).
+    "$ocf" -n "$ns" exec "$pod" -- bash -c \
+      "psql -U ${DB_ADMIN_USER:-postgres} -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
   else
     "$ocf" -n "$ns" exec "$pod" -- bash -c \
       "PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" psql -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
@@ -82,11 +107,21 @@ db_unreadable_objects() {
   db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null
 }
 
-# Decide con qué rol volcar: DB_DUMP_ROLE = auto | app | postgres
+# ¿El rol conecta y puede leerlo todo?
+db_role_works() {
+  local ocf="$1" ns="$2" pod="$3" role="$4"
+  db_psql_as "$ocf" "$ns" "$pod" "$role" "SELECT 1;" >/dev/null 2>&1 || return 1
+  [[ -z "$(db_unreadable_objects "$ocf" "$ns" "$pod" "$role")" ]]
+}
+
+# Decide con qué rol volcar.
+#   DB_DUMP_ROLE = auto | app | postgres | postgres-local
+# En 'auto' se prueban por orden: usuario de la aplicación, superusuario con
+# contraseña del entorno del pod, y superusuario por socket local sin contraseña.
 db_pick_dump_role() {
   local ocf="$1" ns="$2" pod="$3" mode="${DB_DUMP_ROLE:-auto}" blocked
 
-  if [[ "$mode" == app || "$mode" == postgres ]]; then
+  if [[ "$mode" != auto ]]; then
     printf '%s' "$mode"; return 0
   fi
 
@@ -98,73 +133,58 @@ db_pick_dump_role() {
 
   local n; n=$(grep -c . <<< "$blocked")
   warn "El usuario '$PGU' no puede leer $n objetos; pg_dump fallaría con 'permission denied'"
-  printf '%s\n' "$blocked" | sed 's/^/      /' | head -20 >&2
+  printf '%s\n' "$blocked" | head -20 | sed 's/^/      /' >&2
   [[ "$n" -gt 20 ]] && log "      ... y $((n-20)) más"
 
-  if [[ -n "${PGADMIN:-}" ]]; then
-    log "  se usará el superusuario 'postgres' para el volcado (solo lectura)"
+  if [[ -n "${PGADMIN:-}" ]] && db_role_works "$ocf" "$ns" "$pod" postgres; then
+    log "  se usará el superusuario '${DB_ADMIN_USER:-postgres}' con la contraseña del pod (solo lectura)"
     printf 'postgres'; return 0
   fi
 
+  # Último intento: superusuario por el socket local del contenedor. Las imágenes
+  # de PostgreSQL de Red Hat traen PGUSER=postgres precisamente porque permiten
+  # esta conexión sin contraseña desde dentro del pod.
+  log "  probando el superusuario por el socket local del pod (sin contraseña)"
+  if db_role_works "$ocf" "$ns" "$pod" postgres-local; then
+    log "  funciona: se volcará como '${DB_ADMIN_USER:-postgres}' desde dentro del pod (solo lectura)"
+    printf 'postgres-local'; return 0
+  fi
+
+  mkdir -p "$RUN/db"
   printf '%s\n' "$blocked" > "$RUN/db/objetos-sin-permiso.txt"
   cat >&2 <<MSG
 
-  El rol '$PGU' no tiene SELECT sobre esos objetos y el pod no expone
-  POSTGRESQL_ADMIN_PASSWORD, así que no hay un superusuario al que recurrir.
+  El rol '$PGU' no tiene SELECT sobre esos objetos, y no se ha podido usar un
+  superusuario: el pod no expone su contraseña y el socket local tampoco admite
+  la conexión sin contraseña.
 
   Lista completa: $RUN/db/objetos-sin-permiso.txt
 
-  Opciones, de menos a más intrusiva:
+  Comprueba primero si el superusuario funciona dentro del pod:
 
-   a) Si el pod SÍ tiene un superusuario pero con otro nombre de variable de
-      entorno, indícalo en sanba-dr.env (la contraseña se sigue resolviendo
-      dentro del pod, nunca en la línea de comandos):
-          DB_ADMIN_PASSWORD_ENV="<NOMBRE_DE_LA_VARIABLE>"
-          DB_ADMIN_USER="postgres"
-      Para ver qué variables tiene el pod:
-          oc -n $ns exec $pod -- env | grep -i -E 'user|admin|superuser'
+      oc -n $ns exec $pod -- psql -U postgres -c 'select current_user'
 
-   b) Excluir del volcado los esquemas que no puedes leer (perderás esos datos
-      en la prueba de contingencia). En sanba-dr.env:
+  Si eso responde, algo del entorno lo impide; avísalo. Si pide contraseña:
+
+   a) Si el pod tiene la contraseña del superusuario en alguna variable, indica
+      su NOMBRE (no su valor) en sanba-dr.env:
+          DB_ADMIN_PASSWORD_ENV="NOMBRE_DE_LA_VARIABLE"
+      Para ver qué variables hay:
+          oc -n $ns exec $pod -- env | cut -d= -f1 | sort
+
+   b) Excluir del volcado el esquema ilegible. Perderás esos datos en la prueba:
           DB_DUMP_EXTRA_ARGS="-N service_catalog"
 
    c) Pedir al DBA un GRANT de solo lectura en PRODUCCIÓN. Este script no lo
       hace por ti porque escribiría en producción:
-          GRANT USAGE ON SCHEMA <esquema> TO $PGU;
-          GRANT SELECT ON ALL TABLES IN SCHEMA <esquema> TO $PGU;
+          GRANT USAGE  ON SCHEMA <esquema>                 TO $PGU;
+          GRANT SELECT ON ALL TABLES    IN SCHEMA <esquema> TO $PGU;
           GRANT SELECT ON ALL SEQUENCES IN SCHEMA <esquema> TO $PGU;
 
   No se ha modificado nada en producción.
 
 MSG
   die "pg_dump no puede leer todos los objetos con el rol '$PGU'."
-}
-
-# Ejecuta una consulta usando las credenciales que el propio pod tiene en su
-# entorno: la contraseña nunca viaja por la línea de comandos del cliente.
-db_psql() {
-  local ocf="$1" ns="$2" pod="$3" sql="$4"
-  "$ocf" -n "$ns" exec "$pod" -- bash -c \
-    "PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" psql -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
-}
-
-# Número de tablas de usuario en la base de datos
-db_table_count() {
-  db_psql "$1" "$2" "$3" \
-    "SELECT count(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema');" \
-    2>/dev/null | tr -d '[:space:]'
-}
-
-# Conteo EXACTO de filas por tabla, comparable entre clústeres.
-db_rowcounts() {
-  local ocf="$1" ns="$2" pod="$3" out="$4" role="${5:-app}" sql
-  sql="SELECT table_schema||'.'||table_name AS t,
-              (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS n
-       FROM information_schema.tables
-       WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema')
-       ORDER BY 1;"
-  db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null | sort > "$out" \
-    || warn "No se pudieron obtener los conteos de filas en $ns/$pod"
 }
 
 cmd_db_migrate() {
@@ -213,11 +233,14 @@ MSG
   log "  $(wc -l < "$RUN/db/rowcounts-src.txt") tablas en origen"
 
   local pg_user_expr
-  if [[ "$dump_role" == postgres ]]; then
-    pg_user_expr="PGPASSWORD=\"\$${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}\" pg_dump -U ${DB_ADMIN_USER:-postgres}"
-  else
-    pg_user_expr='PGPASSWORD="$POSTGRESQL_PASSWORD" pg_dump -U "$POSTGRESQL_USER"'
-  fi
+  case "$dump_role" in
+    postgres)
+      pg_user_expr="PGPASSWORD=\"\$${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}\" pg_dump -U ${DB_ADMIN_USER:-postgres}" ;;
+    postgres-local)
+      pg_user_expr="pg_dump -U ${DB_ADMIN_USER:-postgres}" ;;
+    *)
+      pg_user_expr='PGPASSWORD="$POSTGRESQL_PASSWORD" pg_dump -U "$POSTGRESQL_USER"' ;;
+  esac
 
   log "  pg_dump (formato custom, comprimido) en $DB_REMOTE_DIR"
   set +e
