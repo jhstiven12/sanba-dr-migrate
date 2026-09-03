@@ -1,0 +1,8 @@
+# Mapeo explícito de hostnames de Route: <host-en-PROD> <host-en-DR>
+#
+# Solo hace falta para hosts custom (los que no siguen el patrón
+# <route>-<namespace>.<apps-domain>), donde el script no puede deducir el
+# equivalente en pre-producción. Se activa con ROUTE_CUSTOM_STRATEGY=map.
+#
+# Ejemplo:
+# sanba.corp.example.com    sanba-dr.corp.example.com

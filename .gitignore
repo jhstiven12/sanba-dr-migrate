@@ -1,0 +1,29 @@
+# Artefactos de cada corrida. NUNCA se publican: contienen datos extraídos del
+# clúster de producción — endpoints de la API, metadatos de namespaces, bindings
+# de SCC y, tras un 'export' completo, el contenido de los Secrets y el volcado
+# de la base de datos.
+out/
+
+# Mapeo de hosts real (puede llevar DNS corporativo)
+route-map.local.txt
+
+# Configuración local con rutas a kubeconfig
+sanba-dr.local.env
+
+# Kubeconfig y credenciales, por si alguien los deja aquí
+*.kubeconfig
+kubeconfig*
+config-prod
+config-preprod
+*.pem
+*.key
+
+# Volcados de base de datos
+*.dump
+*.sql
+*.tar.xz
+
+# Temporales
+*.swp
+*~
+.DS_Store
