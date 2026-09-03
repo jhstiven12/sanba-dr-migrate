@@ -213,8 +213,21 @@ que diga, te indica qué hacer: confiar en la CA del router, `MIRROR_TLS_VERIFY`
 renovar el token o revisar DNS y proxy. Necesita que los registries internos tengan su ruta
 expuesta; si no la tienen, el `export` te avisa y te da el comando
 ([Registry 4.18 → Exposing the registry](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/registry/securing-exposing-registry)).
-Si sus certificados los firma la CA del clúster y tu host no la reconoce, pon
-`MIRROR_TLS_VERIFY="false"` en `sanba-dr.env`.
+**La verificación de certificados viene desactivada** (`MIRROR_TLS_VERIFY="false"`),
+porque los registries internos usan un certificado firmado por la CA del clúster
+que el host no reconoce. Con eso, `skopeo copy` lleva `--src-tls-verify=false
+--dest-tls-verify=false`, `skopeo inspect` lleva `--tls-verify=false` y
+`oc registry login` lleva `--insecure`.
+
+Para volver a verificar, confía primero en la CA del router y pon
+`MIRROR_TLS_VERIFY="true"`:
+
+```bash
+oc get secret -n openshift-ingress-operator router-ca \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d \
+  | sudo tee /etc/pki/ca-trust/source/anchors/ocp-router-ca.crt
+sudo update-ca-trust extract
+```
 
 Y si `manual-todo.txt` menciona Secrets gestionados por Vault o External
 Secrets, créalos en pre-producción antes de continuar: sin ellos los pods se

@@ -157,6 +157,11 @@ cmd_images() {
 
 generate_mirror_script() {
   local reg_src="$1" reg_dst="$2" mirror="$3"
+  local gtls="" ginsec=""
+  if [[ "${MIRROR_TLS_VERIFY:-false}" == false ]]; then
+    gtls=" --src-tls-verify=false --dest-tls-verify=false"
+    ginsec=" --insecure"
+  fi
   {
     echo '#!/usr/bin/env bash'
     echo '# Generado por sanba-dr-migrate.sh. Copia cada imagen POR DIGEST, de modo'
@@ -166,8 +171,8 @@ generate_mirror_script() {
     echo
     echo "# Autenticación previa (usa el token de cada kubeconfig; no hay que"
     echo "# adivinar el nombre de usuario):"
-    echo "#   KUBECONFIG=\"\$KUBECONFIG_SRC\" oc registry login --registry ${reg_src:-<registry-produccion>} --to /tmp/auth-src.json"
-    echo "#   KUBECONFIG=\"\$KUBECONFIG_DST\" oc registry login --registry ${reg_dst:-<registry-preproduccion>} --to /tmp/auth-dst.json"
+    echo "#   KUBECONFIG=\"\$KUBECONFIG_SRC\" oc registry login --registry ${reg_src:-<registry-produccion>} --to /tmp/auth-src.json${ginsec}"
+    echo "#   KUBECONFIG=\"\$KUBECONFIG_DST\" oc registry login --registry ${reg_dst:-<registry-preproduccion>} --to /tmp/auth-dst.json${ginsec}"
     echo "# y añade a cada skopeo copy:"
     echo "#   --src-authfile /tmp/auth-src.json --dest-authfile /tmp/auth-dst.json"
     echo
@@ -181,7 +186,8 @@ generate_mirror_script() {
     dst_ext="$(to_external_ref "${repo}:${tag}" "$reg_dst")"
     {
       echo "# $d  $workload  ($container)"
-      echo "skopeo copy --all --retry-times 3 \\"
+      echo "skopeo copy --all --retry-times 3${gtls} \\"
+      echo "  --src-authfile /tmp/auth-src.json --dest-authfile /tmp/auth-dst.json \\"
       echo "  docker://${src_ext} \\"
       echo "  docker://${dst_ext}"
       echo
@@ -240,7 +246,7 @@ tf_rewrite_images() {
 registry_auth() {
   local ocf="$1" registry="$2" authfile="$3" label="$4"
   local insec="" kc
-  [[ "${MIRROR_TLS_VERIFY:-true}" == false ]] && insec="--insecure"
+  [[ "${MIRROR_TLS_VERIFY:-false}" == false ]] && insec="--insecure"
   [[ "$label" == "PRODUCCIÓN" ]] && kc='$KUBECONFIG_SRC' || kc='$KUBECONFIG_DST'
 
   if "$ocf" registry login --registry "$registry" --to "$authfile" $insec \
@@ -337,8 +343,15 @@ cmd_mirror() {
   log "  DESTINO: $reg_dst"
   log "  Imágenes a copiar: $pendientes"
 
-  local tlsflags=""
-  [[ "${MIRROR_TLS_VERIFY:-true}" == false ]] && tlsflags="--src-tls-verify=false --dest-tls-verify=false"
+  # Cada subcomando de skopeo tiene sus propios flags de TLS: 'copy' usa
+  # --src-tls-verify/--dest-tls-verify, e 'inspect' usa --tls-verify. Pasarle a
+  # inspect los de copy hacía que la verificación del digest fallara siempre.
+  local copy_tls="" inspect_tls=""
+  if [[ "${MIRROR_TLS_VERIFY:-false}" == false ]]; then
+    copy_tls="--src-tls-verify=false --dest-tls-verify=false"
+    inspect_tls="--tls-verify=false"
+    log "  verificación de certificados TLS DESACTIVADA (MIRROR_TLS_VERIFY=false)"
+  fi
 
   if [[ "${DRY_RUN:-false}" == true ]]; then
     log "(dry-run) no se copia nada; revisa $RUN/mirror-commands.sh"
@@ -371,13 +384,13 @@ cmd_mirror() {
     digest="${src##*@}"
 
     log "  $d $workload/$container"
-    if skopeo copy --all --retry-times 3 $tlsflags \
+    if skopeo copy --all --retry-times 3 $copy_tls \
          --src-authfile "$auth_src" --dest-authfile "$auth_dst" \
          "docker://${src_ext}" "docker://${dst_ext}" >/dev/null 2>"$RUN/.skopeo.err"; then
       copiadas=$((copiadas+1))
       # La prueba de que es "tal cual": el digest del destino debe coincidir.
       if [[ "$src" == *@sha256:* ]]; then
-        got=$(skopeo inspect --raw $tlsflags --authfile "$auth_dst" "docker://${dst_ext}" 2>/dev/null \
+        got=$(skopeo inspect --raw $inspect_tls --authfile "$auth_dst" "docker://${dst_ext}" 2>/dev/null \
               | sha256sum | awk '{print "sha256:"$1}')
         if [[ "$got" == "$digest" ]]; then
           ok "  digest verificado: $digest"

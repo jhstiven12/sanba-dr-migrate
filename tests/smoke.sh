@@ -72,6 +72,10 @@ trig=$(yq -o=json '.' out/SMOKE/clean/sanba-data-persistence-dr/50-deploymentcon
 grep -q 'skopeo copy --all' out/SMOKE/mirror-commands.sh \
   && grep -q '@sha256:' out/SMOKE/mirror-commands.sh \
   && ok "mirror-commands.sh copia por digest" || bad "mirror-commands.sh incorrecto"
+grep -q -- '--src-tls-verify=false --dest-tls-verify=false' out/SMOKE/mirror-commands.sh \
+  && ok "los skopeo copy llevan los flags de TLS desactivado" || bad "faltan los flags de TLS"
+grep -q -- '--insecure' out/SMOKE/mirror-commands.sh \
+  && ok "oc registry login lleva --insecure" || bad "falta --insecure en el login"
 
 head_ "db-migrate de extremo a extremo"
 rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
