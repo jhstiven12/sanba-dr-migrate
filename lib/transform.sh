@@ -274,18 +274,39 @@ tf_cluster_bindings() {
   # Asignaciones de SCC -> TSV:  scc <TAB> ns_destino <TAB> serviceaccount <TAB> origen
   # El origen importa: las que vienen de un RoleBinding namespaced ya se migran
   # como manifiesto, así que 'apply' no debe volver a concederlas.
+  #
+  # Cada fuente es opcional: un export hecho con una versión anterior del script
+  # puede no tener todos los ficheros, y eso no debe abortar la transformación.
+  _scc_source() {
+    local file="$1" prog="$2"
+    if [[ ! -r "$file" ]]; then
+      vlog "  fuente de SCC ausente: $(basename "$file") (export de una versión anterior)"
+      return 0
+    fi
+    jq -r --argjson m "$nsmap" "$prog" < "$file" 2>/dev/null || true
+  }
+
   {
-    jq -r --argjson m "$nsmap" '
+    _scc_source "$RAW/_cluster/scc-crb.json" '
       .[] | .scc as $scc | .subjects[]
-      | [$scc, ($m[.namespace] // .namespace), .name, "clusterrolebinding"] | @tsv' < "$RAW/_cluster/scc-crb.json"
-    jq -r --argjson m "$nsmap" '
+      | [$scc, ($m[.namespace] // .namespace), .name, "clusterrolebinding"] | @tsv'
+    _scc_source "$RAW/_cluster/scc-rb.json" '
       .[] | .scc as $scc | .subjects[]
-      | [$scc, ($m[.namespace] // .namespace), .name, "rolebinding"] | @tsv' < "$RAW/_cluster/scc-rb.json"
-    jq -r --argjson m "$nsmap" '
+      | [$scc, ($m[.namespace] // .namespace), .name, "rolebinding"] | @tsv'
+    _scc_source "$RAW/_cluster/scc-users.json" '
       .[] | .scc as $scc | .users[]
       | split(":") | select(length == 4)
-      | [$scc, ($m[.[2]] // .[2]), .[3], "scc.users"] | @tsv' < "$RAW/_cluster/scc-users.json"
-  } 2>/dev/null | sort -u > "$CLEAN/_cluster/scc-assignments.tsv"
+      | [$scc, ($m[.[2]] // .[2]), .[3], "scc.users"] | @tsv'
+  } | sort -u > "$CLEAN/_cluster/scc-assignments.tsv"
+
+  # Si falta scc-rb.json, las SCC concedidas por RoleBinding namespaced no
+  # aparecen en el inventario. El RoleBinding sí se migra igualmente (va en
+  # 14-rolebinding), pero conviene rehacer el export para que el informe y la
+  # validación estén completos.
+  if [[ ! -r "$RAW/_cluster/scc-rb.json" ]]; then
+    warn "Este export es de una versión anterior del script: falta scc-rb.json"
+    todo "Vuelve a ejecutar 'export' (es de solo lectura) para que el inventario de SCC quede completo."
+  fi
 
   local n; n=$(wc -l < "$CLEAN/_cluster/scc-assignments.tsv")
   log "  Asignaciones de SCC detectadas: $n"
