@@ -102,4 +102,38 @@ w(f"{RUN}/raw/_cluster/clusterrolebinding.json",L([{"apiVersion":"rbac.authoriza
  "metadata":{"name":"sanba-core-cluster-reader","uid":"z"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-reader"},
  "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]}]))
 open(f"{RUN}/raw/_cluster/custom-resources.txt","w").write("sanba-core\tservicemonitor.monitoring.coreos.com/sanba-core\n")
+
+# --- pods en ejecución, para resolver el digest EXACTO que corre en PROD -----
+DIG_GUI = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+DIG_PG  = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+w(f"{RUN}/raw/sanba-gui/replicaset.json", L([
+ {"apiVersion":"apps/v1","kind":"ReplicaSet",
+  "metadata":{"name":"sanba-gui-7d9f","namespace":"sanba-gui",
+              "ownerReferences":[{"kind":"Deployment","name":"sanba-gui"}]}}]))
+w(f"{RUN}/raw/sanba-gui/pod.json", L([
+ {"apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"sanba-gui-7d9f-k2m4","namespace":"sanba-gui",
+              "ownerReferences":[{"kind":"ReplicaSet","name":"sanba-gui-7d9f"}]},
+  "status":{"phase":"Running","containerStatuses":[
+     {"name":"web",
+      "image":"image-registry.openshift-image-registry.svc:5000/sanba-gui/sanba-gui:prod",
+      "imageID":"docker-pullable://image-registry.openshift-image-registry.svc:5000/sanba-gui/sanba-gui@"+DIG_GUI}]}}]))
+
+w(f"{RUN}/raw/sanba-data-persistence/replicationcontroller.json", L([
+ {"apiVersion":"v1","kind":"ReplicationController",
+  "metadata":{"name":"postgresql-1","namespace":"sanba-data-persistence",
+              "ownerReferences":[{"kind":"DeploymentConfig","name":"postgresql"}]}}]))
+w(f"{RUN}/raw/sanba-data-persistence/pod.json", L([
+ {"apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"postgresql-1-vv8q","namespace":"sanba-data-persistence",
+              "ownerReferences":[{"kind":"ReplicationController","name":"postgresql-1"}]},
+  "status":{"phase":"Running","containerStatuses":[
+     {"name":"postgresql",
+      "image":"registry.redhat.io/rhel8/postgresql-10:latest",
+      "imageID":"registry.redhat.io/rhel8/postgresql-10@"+DIG_PG}]}}]))
+
+open(f"{RUN}/registry-src.txt","w").write("default-route-openshift-image-registry.apps.prod.example.com\n")
+open(f"{RUN}/registry-dst.txt","w").write("default-route-openshift-image-registry.apps.preprod.example.com\n")
+
 print("fixtures OK")

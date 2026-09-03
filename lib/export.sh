@@ -17,6 +17,12 @@ horizontalpodautoscaler poddisruptionbudget"
 # Recursos que solo se exportan para el informe (no se aplican en DR)
 EXPORT_KINDS_REPORT="resourcequota limitrange buildconfig imagestream"
 
+# Necesarios para saber qué imagen EXACTA (por digest) está corriendo ahora en
+# producción: los pods traen el digest en .status.containerStatuses[].imageID, y
+# la cadena de propietarios pod -> rs/rc -> deployment/dc dice a qué workload
+# pertenece. No se aplican en contingencia.
+EXPORT_KINDS_IMAGES="pod replicaset replicationcontroller"
+
 # Grupos de API ya cubiertos arriba; el resto se considera "de operador"
 _CORE_API_GROUPS='^(v1|apps|batch|extensions|policy|autoscaling|networking[.]k8s[.]io|rbac[.]authorization[.]k8s[.]io|events[.]k8s[.]io|discovery[.]k8s[.]io|coordination[.]k8s[.]io|metrics[.]k8s[.]io|route[.]openshift[.]io|apps[.]openshift[.]io|build[.]openshift[.]io|image[.]openshift[.]io|authorization[.]openshift[.]io|template[.]openshift[.]io|packages[.]operators[.]coreos[.]com)$'
 
@@ -36,7 +42,7 @@ kind_available() { grep -qE "^$1s(\.|$)" <<< "$_AVAIL_KINDS"; }
 export_namespace_resources() {
   local ns="$1" kind list all n kinds_found
   list=""
-  for kind in $EXPORT_KINDS_APPLY $EXPORT_KINDS_REPORT; do
+  for kind in $EXPORT_KINDS_APPLY $EXPORT_KINDS_REPORT $EXPORT_KINDS_IMAGES; do
     kind_available "$kind" || { vlog "$ns: el tipo '$kind' no existe en el clúster"; continue; }
     list+="${list:+,}$kind"
   done
@@ -173,6 +179,27 @@ export_domains() {
   ok "Dominios detectados"
 }
 
+# El registry interno (image-registry.openshift-image-registry.svc:5000) no es
+# alcanzable desde fuera del clúster. Para que skopeo pueda leerlo hace falta su
+# ruta expuesta.  Ref: Registry 4.18 > Exposing the registry.
+export_registry_routes() {
+  step "Registries internos"
+  local rs rd
+  rs=$(oc_src -n openshift-image-registry get route default-route -o jsonpath='{.spec.host}' 2>/dev/null || true)
+  rd=$(oc_dst -n openshift-image-registry get route default-route -o jsonpath='{.spec.host}' 2>/dev/null || true)
+  printf '%s\n' "$rs" > "$RUN/registry-src.txt"
+  printf '%s\n' "$rd" > "$RUN/registry-dst.txt"
+
+  if [[ -n "$rs" ]]; then ok "ORIGEN : $rs"; else
+    warn "El registry interno de PRODUCCIÓN no tiene ruta expuesta"
+    todo "Expón el registry de producción para poder leerlo con skopeo: oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge -p '{\"spec\":{\"defaultRoute\":true}}'  (esto ESCRIBE en producción: decídelo tú)"
+  fi
+  if [[ -n "$rd" ]]; then ok "DESTINO: $rd"; else
+    warn "El registry interno de PRE-PRODUCCIÓN no tiene ruta expuesta"
+    todo "Expón el registry de pre-producción: oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge -p '{\"spec\":{\"defaultRoute\":true}}'"
+  fi
+}
+
 cmd_export() {
   require_cmd oc jq
   step "Exportando desde el clúster ORIGEN (solo lectura)"
@@ -189,6 +216,7 @@ cmd_export() {
   export_scc_bindings
   detect_custom_resources
   export_domains
+  export_registry_routes
 
   step "Export terminado"
   log "Artefactos crudos en: $RAW"

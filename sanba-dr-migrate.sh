@@ -38,6 +38,8 @@ SUBCOMANDOS
   transform    Sanea, renombra namespaces y reescribe Routes -> out/<run>/clean.
   apply        Aplica los manifiestos en el clúster DESTINO en orden de dependencias.
                Encadena db-migrate justo después de levantar la base de datos.
+  mirror       Copia con skopeo, POR DIGEST, las imágenes del registry interno de
+               producción al de pre-producción, y verifica que el digest coincide.
   db-migrate   pg_dump en PROD -> pg_restore en DR, con comparación de filas.
   validate     Comprueba rollouts, pods, PVCs, URLs, BD, ServiceAccounts y config.
   all          preflight -> export -> transform -> apply -> validate.
@@ -219,6 +221,7 @@ case "$CMD" in
   export)     cmd_export ;;
   transform)  cmd_transform ;;
   apply)      cmd_apply ;;
+  mirror)     cmd_mirror    || EXIT_RC=$? ;;
   db-migrate) cmd_db_migrate ;;
   validate)   cmd_validate  || EXIT_RC=$? ;;
   all)        cmd_all       || EXIT_RC=$? ;;

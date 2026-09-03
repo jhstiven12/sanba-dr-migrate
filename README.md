@@ -176,12 +176,39 @@ de las Routes y genera los informes en `out/<run>/`.
 | `reports/config.txt` | ConfigMaps y Secrets, número de claves y quién los consume. |
 | `reports/ns-rewrites.txt` | Qué claves contenían un nombre de namespace y fueron reescritas. |
 
-Si hay imágenes internas:
+### Imágenes
+
+El script resuelve, para cada contenedor, **el digest que está corriendo ahora
+mismo en producción** —lo lee de `.status.containerStatuses[].imageID` de los
+pods y sigue la cadena `pod → ReplicaSet/ReplicationController → workload`— y
+fija ese digest en los manifiestos de contingencia. Un tag como `:prod` o
+`:latest` es móvil: si el drill tira del tag, se puede acabar ejecutando una
+build distinta de la que hay en producción, y entonces la prueba no vale.
+
+- Imágenes del **registry interno de producción**: hay que copiarlas al registry
+  de pre-producción. `skopeo copy --all` conserva el manifiesto y por tanto el
+  digest, así que en contingencia se ejecuta exactamente el mismo contenido.
+- Imágenes de **registries que pre-producción ya alcanza** (catálogo de Red Hat,
+  Nexus, Quay): no se copian, pero sí se fijan por digest.
+
+También se eliminan los disparadores `ImageChange` y la anotación
+`image.openshift.io/triggers`: si se dejaran, OpenShift sobrescribiría el digest
+con lo que dijera un ImageStream que en contingencia no existe, y el despliegue
+se quedaría esperando indefinidamente.
 
 ```bash
-less out/<run>/mirror-commands.sh    # revísalo primero
-bash out/<run>/mirror-commands.sh    # lo genera el script, pero no lo ejecuta
+less out/<run>/reports/images.txt    # qué imagen usa cada contenedor
+less out/<run>/mirror-commands.sh    # los skopeo copy, para revisarlos
+./sanba-dr-migrate.sh mirror         # los ejecuta y verifica el digest resultante
 ```
+
+`mirror` se autentica en ambos registries con los tokens de tus sesiones de `oc`
+y, tras copiar, compara el digest del destino con el del origen: si no coincide,
+lo marca como fallo. Necesita que los registries internos tengan su ruta
+expuesta; si no la tienen, el `export` te avisa y te da el comando
+([Registry 4.18 → Exposing the registry](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/registry/securing-exposing-registry)).
+Si sus certificados los firma la CA del clúster y tu host no la reconoce, pon
+`MIRROR_TLS_VERIFY="false"` en `sanba-dr.env`.
 
 Y si `manual-todo.txt` menciona Secrets gestionados por Vault o External
 Secrets, créalos en pre-producción antes de continuar: sin ellos los pods se

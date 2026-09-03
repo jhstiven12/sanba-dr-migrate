@@ -55,6 +55,24 @@ rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
 ./sanba-dr-migrate.sh apply --run SMOKE --dry-run >/dev/null 2>&1 && ok "apply --dry-run (JSON)" || bad "apply --dry-run (JSON)"
 rm -f tests/yq
 
+head_ "Fijado de imágenes por digest"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+awk -F'\t' '$7=="si"' out/SMOKE/image-map.tsv | grep -q 'sanba-gui-dr' \
+  && ok "el registry interno se marca para mirror" || bad "no se detectó la imagen interna"
+awk -F'\t' '$7=="no"' out/SMOKE/image-map.tsv | grep -q 'registry.redhat.io' \
+  && ok "el catálogo Red Hat se fija sin mirror" || bad "no se fijó la imagen de catálogo"
+img=$(yq -o=json '.' out/SMOKE/clean/sanba-gui-dr/50-deployment.yaml | jq -r '.items[].spec.template.spec.containers[0].image')
+[[ "$img" == *"/sanba-gui-dr/"*"@sha256:"* ]] \
+  && ok "el manifiesto apunta al registry de DR por digest" || bad "manifiesto sin fijar: $img"
+img=$(yq -o=json '.' out/SMOKE/clean/sanba-data-persistence-dr/50-deploymentconfig.yaml | jq -r '.items[].spec.template.spec.containers[0].image')
+[[ "$img" == *"@sha256:"* ]] && ok "la imagen de catálogo queda por digest" || bad "sigue por tag: $img"
+trig=$(yq -o=json '.' out/SMOKE/clean/sanba-data-persistence-dr/50-deploymentconfig.yaml | jq -r '[.items[].spec.triggers[]?.type] | join(",")')
+[[ -z "$trig" ]] && ok "disparadores ImageChange eliminados" || bad "queda un disparador: $trig"
+grep -q 'skopeo copy --all' out/SMOKE/mirror-commands.sh \
+  && grep -q '@sha256:' out/SMOKE/mirror-commands.sh \
+  && ok "mirror-commands.sh copia por digest" || bad "mirror-commands.sh incorrecto"
+
 head_ "db-migrate de extremo a extremo"
 rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
 salida=$(./sanba-dr-migrate.sh db-migrate --run SMOKE 2>&1)

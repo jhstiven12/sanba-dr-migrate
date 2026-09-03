@@ -191,7 +191,9 @@ read_manifest() {
 # un único JSON por namespace y las consultas leen de ahí.
 # ---------------------------------------------------------------------------
 clean_cache() {
-  local d="$1" cache="$RUN/.cache-clean-$d.json" f
+  local d="$1"
+  local cache="$RUN/.cache-clean-$d.json"
+  local f
   if [[ ! -s "$cache" ]]; then
     for f in "$CLEAN/$d"/[0-9]*-*.yaml "$CLEAN/$d"/[0-9]*-*.json; do
       [[ -r "$f" ]] || continue

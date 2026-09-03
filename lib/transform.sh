@@ -582,6 +582,7 @@ cmd_transform() {
   tf_report_rewrites
   tf_routes
   cmd_images
+  tf_rewrite_images
   tf_quota_report
 
   step "Transform terminado"
