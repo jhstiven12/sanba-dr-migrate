@@ -34,13 +34,110 @@ db_find_pod() {
 # Red Hat). Nunca se imprimen: solo se exportan a PGU/PGP/PGD.
 db_creds() {
   local ocf="$1" ns="$2" pod="$3" raw
+  local admvar="${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}"
+  # La contraseña se resuelve DENTRO del pod: nunca aparece en la línea de
+  # comandos del cliente ni en la lista de procesos de este host.
   raw=$("$ocf" -n "$ns" exec "$pod" -- bash -c \
-        'printf "%s\037%s\037%s" "${POSTGRESQL_USER:-}" "${POSTGRESQL_PASSWORD:-}" "${POSTGRESQL_DATABASE:-}"' 2>/dev/null) \
+        "printf '%s\037%s\037%s\037%s' \"\${POSTGRESQL_USER:-}\" \"\${POSTGRESQL_PASSWORD:-}\" \"\${POSTGRESQL_DATABASE:-}\" \"\${${admvar}:-}\"" 2>/dev/null) \
     || die "No se pudo ejecutar en el pod $ns/$pod"
-  IFS=$'\037' read -r PGU PGP PGD <<< "$raw"
+  IFS=$'\037' read -r PGU PGP PGD PGADMIN <<< "$raw"
   [[ -n "${PGU:-}" && -n "${PGD:-}" ]] \
     || die "El pod $ns/$pod no expone POSTGRESQL_USER/POSTGRESQL_DATABASE. Indica el pod correcto con DB_SELECTOR."
-  log "  pod=$pod  usuario=$PGU  base=$PGD  (contraseña leída del pod, no se registra)"
+  if [[ -n "${PGADMIN:-}" ]]; then
+    log "  pod=$pod  usuario=$PGU  base=$PGD  (superusuario '${DB_ADMIN_USER:-postgres}' disponible via \$$admvar)"
+  else
+    log "  pod=$pod  usuario=$PGU  base=$PGD  (el pod no expone \$$admvar)"
+  fi
+}
+
+# Ejecuta psql con el rol indicado: "app" (POSTGRESQL_USER) o "postgres"
+# (superusuario, solo si el pod expone POSTGRESQL_ADMIN_PASSWORD).
+# La contraseña se resuelve DENTRO del pod: nunca viaja en la línea de comandos.
+db_psql_as() {
+  local ocf="$1" ns="$2" pod="$3" role="$4" sql="$5"
+  if [[ "$role" == postgres ]]; then
+    "$ocf" -n "$ns" exec "$pod" -- bash -c \
+      "PGPASSWORD=\"\$${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}\" psql -U ${DB_ADMIN_USER:-postgres} -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
+  else
+    "$ocf" -n "$ns" exec "$pod" -- bash -c \
+      "PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" psql -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" -At -F' ' -c \"$sql\""
+  fi
+}
+
+# Objetos que el rol indicado NO puede leer. Si devuelve algo, pg_dump fallará
+# con "permission denied for relation ...". Detectarlo antes ahorra un volcado
+# largo que acaba abortando.
+db_unreadable_objects() {
+  local ocf="$1" ns="$2" pod="$3" role="$4" sql
+  sql="SELECT n.nspname || '.' || c.relname || '  [' ||
+              CASE c.relkind WHEN 'r' THEN 'tabla' WHEN 'p' THEN 'tabla'
+                             WHEN 'S' THEN 'secuencia' WHEN 'v' THEN 'vista'
+                             WHEN 'm' THEN 'vista mat.' ELSE c.relkind::text END || ']'
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+         AND n.nspname NOT LIKE 'pg_%'
+         AND ( (c.relkind IN ('r','p','v','m','f') AND NOT has_table_privilege(c.oid,'SELECT'))
+            OR (c.relkind = 'S' AND NOT has_sequence_privilege(c.oid,'SELECT')) )
+       ORDER BY 1;"
+  db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null
+}
+
+# Decide con qué rol volcar: DB_DUMP_ROLE = auto | app | postgres
+db_pick_dump_role() {
+  local ocf="$1" ns="$2" pod="$3" mode="${DB_DUMP_ROLE:-auto}" blocked
+
+  if [[ "$mode" == app || "$mode" == postgres ]]; then
+    printf '%s' "$mode"; return 0
+  fi
+
+  blocked=$(db_unreadable_objects "$ocf" "$ns" "$pod" app)
+  if [[ -z "$blocked" ]]; then
+    log "  el usuario '$PGU' puede leer todos los objetos"
+    printf 'app'; return 0
+  fi
+
+  local n; n=$(grep -c . <<< "$blocked")
+  warn "El usuario '$PGU' no puede leer $n objetos; pg_dump fallaría con 'permission denied'"
+  printf '%s\n' "$blocked" | sed 's/^/      /' | head -20 >&2
+  [[ "$n" -gt 20 ]] && log "      ... y $((n-20)) más"
+
+  if [[ -n "${PGADMIN:-}" ]]; then
+    log "  se usará el superusuario 'postgres' para el volcado (solo lectura)"
+    printf 'postgres'; return 0
+  fi
+
+  printf '%s\n' "$blocked" > "$RUN/db/objetos-sin-permiso.txt"
+  cat >&2 <<MSG
+
+  El rol '$PGU' no tiene SELECT sobre esos objetos y el pod no expone
+  POSTGRESQL_ADMIN_PASSWORD, así que no hay un superusuario al que recurrir.
+
+  Lista completa: $RUN/db/objetos-sin-permiso.txt
+
+  Opciones, de menos a más intrusiva:
+
+   a) Si el pod SÍ tiene un superusuario pero con otro nombre de variable de
+      entorno, indícalo en sanba-dr.env (la contraseña se sigue resolviendo
+      dentro del pod, nunca en la línea de comandos):
+          DB_ADMIN_PASSWORD_ENV="<NOMBRE_DE_LA_VARIABLE>"
+          DB_ADMIN_USER="postgres"
+      Para ver qué variables tiene el pod:
+          oc -n $ns exec $pod -- env | grep -i -E 'user|admin|superuser'
+
+   b) Excluir del volcado los esquemas que no puedes leer (perderás esos datos
+      en la prueba de contingencia). En sanba-dr.env:
+          DB_DUMP_EXTRA_ARGS="-N service_catalog"
+
+   c) Pedir al DBA un GRANT de solo lectura en PRODUCCIÓN. Este script no lo
+      hace por ti porque escribiría en producción:
+          GRANT USAGE ON SCHEMA <esquema> TO $PGU;
+          GRANT SELECT ON ALL TABLES IN SCHEMA <esquema> TO $PGU;
+          GRANT SELECT ON ALL SEQUENCES IN SCHEMA <esquema> TO $PGU;
+
+  No se ha modificado nada en producción.
+
+MSG
+  die "pg_dump no puede leer todos los objetos con el rol '$PGU'."
 }
 
 # Ejecuta una consulta usando las credenciales que el propio pod tiene en su
@@ -60,13 +157,13 @@ db_table_count() {
 
 # Conteo EXACTO de filas por tabla, comparable entre clústeres.
 db_rowcounts() {
-  local ocf="$1" ns="$2" pod="$3" out="$4" sql
+  local ocf="$1" ns="$2" pod="$3" out="$4" role="${5:-app}" sql
   sql="SELECT table_schema||'.'||table_name AS t,
               (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS n
        FROM information_schema.tables
        WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema')
        ORDER BY 1;"
-  db_psql "$ocf" "$ns" "$pod" "$sql" 2>/dev/null | sort > "$out" \
+  db_psql_as "$ocf" "$ns" "$pod" "$role" "$sql" 2>/dev/null | sort > "$out" \
     || warn "No se pudieron obtener los conteos de filas en $ns/$pod"
 }
 
@@ -106,16 +203,48 @@ MSG
   log "ORIGEN:"
   db_creds oc_src "$src_ns" "$src_pod"
 
+  # Antes de volcar: comprobar que el rol puede leer TODOS los objetos. Si no,
+  # se elige el superusuario o se aborta con la lista exacta de lo que falla.
+  local dump_role; dump_role=$(db_pick_dump_role oc_src "$src_ns" "$src_pod")
+  log "  rol de volcado: $dump_role"
+
   log "  conteo de filas previo al volcado"
-  db_rowcounts oc_src "$src_ns" "$src_pod" "$RUN/db/rowcounts-src.txt"
+  db_rowcounts oc_src "$src_ns" "$src_pod" "$RUN/db/rowcounts-src.txt" "$dump_role"
   log "  $(wc -l < "$RUN/db/rowcounts-src.txt") tablas en origen"
 
+  local pg_user_expr
+  if [[ "$dump_role" == postgres ]]; then
+    pg_user_expr="PGPASSWORD=\"\$${DB_ADMIN_PASSWORD_ENV:-POSTGRESQL_ADMIN_PASSWORD}\" pg_dump -U ${DB_ADMIN_USER:-postgres}"
+  else
+    pg_user_expr='PGPASSWORD="$POSTGRESQL_PASSWORD" pg_dump -U "$POSTGRESQL_USER"'
+  fi
+
   log "  pg_dump (formato custom, comprimido) en $DB_REMOTE_DIR"
+  set +e
   oc_src exec -n "$src_ns" "$src_pod" -- bash -c \
-    "mkdir -p $DB_REMOTE_DIR && PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" pg_dump \
-       -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" \
-       -Fc -Z6 --no-owner --no-privileges -f $DB_REMOTE_DIR/$DB_DUMP_NAME" \
-    || die "pg_dump falló en $src_ns/$src_pod"
+    "mkdir -p $DB_REMOTE_DIR && $pg_user_expr -d \"\$POSTGRESQL_DATABASE\" \
+       -Fc -Z6 --no-owner --no-privileges ${DB_DUMP_EXTRA_ARGS:-} \
+       -f $DB_REMOTE_DIR/$DB_DUMP_NAME" \
+    > "$RUN/db/pg_dump.log" 2>&1
+  local dump_rc=$?
+  set -e
+  if (( dump_rc != 0 )); then
+    err "pg_dump falló en $src_ns/$src_pod (rc=$dump_rc)"
+    sed -n '1,20p' "$RUN/db/pg_dump.log" | sed 's/^/      /' >&2
+    if grep -qi 'permission denied' "$RUN/db/pg_dump.log"; then
+      cat >&2 <<MSG
+
+  Sigue habiendo objetos que el rol '$dump_role' no puede leer. Revisa
+  $RUN/db/pg_dump.log y usa DB_DUMP_EXTRA_ARGS para excluir ese esquema, o
+  pide al DBA el GRANT de solo lectura correspondiente.
+
+MSG
+    fi
+    # Limpiar el fichero parcial que dejó este script en el pod de producción
+    oc_src exec -n "$src_ns" "$src_pod" -- rm -rf "$DB_REMOTE_DIR" >/dev/null 2>&1 || true
+    die "No se pudo generar el volcado. En producción no se ha modificado nada."
+  fi
+  ok "pg_dump completado (traza en $RUN/db/pg_dump.log)"
 
   # oc rsync: método documentado por Red Hat para bajar archivos de BD de un pod.
   mkdir -p "$RUN/db/incoming"

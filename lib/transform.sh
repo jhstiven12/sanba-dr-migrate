@@ -150,6 +150,13 @@ def keep:
     # secrets autogenerados: aplicarlas los destruiría. La 'default' se reconcilia
     # con un patch en apply.sh.
     (.metadata.name | IN("default","builder","deployer") | not)
+  elif .kind == "RoleBinding" then
+    # OpenShift crea estos RoleBindings solo en cada namespace nuevo. Copiar el
+    # 'admin' de producción daría permisos de administrador sobre el namespace de
+    # contingencia a los dueños del proyecto de producción.
+    (\$keeprb == "true")
+    or (.metadata.name | IN("admin","system:deployers","system:image-builders",
+                            "system:image-pullers","system:image-puller") | not)
   else true end;
 
 { apiVersion: "v1", kind: "List",
@@ -208,6 +215,7 @@ tf_namespaced() {
          --argjson nsmap "$nsmap" --argjson scmap "$scmap" --argjson routemap "$routemap" \
          --arg nsre "$nsre" --arg srcdom "$srcdom" --arg dstdom "$dstdom" \
          --arg tlsmode "$ROUTE_TLS_STRATEGY" --arg custom "$ROUTE_CUSTOM_STRATEGY" \
+         --arg keeprb "${MIGRATE_DEFAULT_ROLEBINDINGS:-false}" \
          "$prog" < "$in" > "$RUN/.tmp.json" \
         || die "jq falló transformando $s/$kind"
 
@@ -443,6 +451,31 @@ tf_config_refs() {
   ok "Inventario en $REPORTS/config.txt"
 }
 
+# --- RoleBindings autogenerados por OpenShift -------------------------------
+tf_report_default_rolebindings() {
+  [[ "${MIGRATE_DEFAULT_ROLEBINDINGS:-false}" == true ]] && return 0
+  local s d n subs
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    [[ -r "$RAW/$s/rolebinding.json" ]] || continue
+    while IFS=$'\t' read -r name subs; do
+      [[ -z "${name:-}" ]] && continue
+      if [[ "$name" == "admin" ]]; then
+        warn "$d: NO se migra el RoleBinding 'admin' de PROD (daría admin en contingencia a: ${subs:-?})"
+        todo "$d: el RoleBinding 'admin' de producción no se migra por seguridad. Si necesitas esos permisos en contingencia, concédelos a mano: oc -n $d adm policy add-role-to-user admin <usuario>"
+      else
+        vlog "$d: se omite el RoleBinding autogenerado '$name'"
+      fi
+    done < <(jq -r '
+      .items[]
+      | select(.metadata.name | IN("admin","system:deployers","system:image-builders","system:image-pullers","system:image-puller"))
+      | [ .metadata.name,
+          ([ (.subjects // [])[] | (.kind // "?") + "/" + (.name // "?") ] | join(",")) ] | @tsv' \
+      < "$RAW/$s/rolebinding.json" 2>/dev/null)
+  done
+  return 0
+}
+
 # --- Routes -----------------------------------------------------------------
 tf_routes() {
   step "Routes"
@@ -512,6 +545,7 @@ cmd_transform() {
 
   tf_namespaces
   tf_namespaced
+  tf_report_default_rolebindings
   tf_cluster_bindings
   tf_serviceaccounts
   tf_config_refs

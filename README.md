@@ -309,6 +309,84 @@ Notas sobre dos de ellos:
 
 ---
 
+## Problemas frecuentes
+
+### `pg_dump: permission denied for relation <objeto>`
+
+El usuario de la aplicación no tiene `SELECT` sobre alguna tabla o secuencia,
+normalmente porque la creó otro rol (un esquema añadido por una migración, un
+módulo de terceros). `pg_dump` aborta al leer el valor de esas secuencias.
+
+El script lo detecta **antes** de lanzar el volcado: consulta qué objetos no
+puede leer el rol y actúa según el caso.
+
+- Si el pod expone `POSTGRESQL_ADMIN_PASSWORD`, cambia solo al superusuario y
+  continúa. Sigue siendo una operación de solo lectura.
+- Si no, se detiene sin tocar nada, deja la lista completa en
+  `out/<run>/db/objetos-sin-permiso.txt` y te da tres salidas:
+
+  **a) El superusuario existe con otro nombre de variable.** Mira qué tiene el pod:
+
+  ```bash
+  oc -n sanba-data-persistence exec <pod> -- env | grep -i -E 'user|admin|superuser'
+  ```
+
+  y ponlo en `sanba-dr.env`:
+
+  ```bash
+  DB_ADMIN_PASSWORD_ENV="<NOMBRE_DE_LA_VARIABLE>"
+  DB_ADMIN_USER="postgres"
+  ```
+
+  La contraseña se sigue resolviendo dentro del pod: nunca viaja por la línea de
+  comandos del host ni aparece en la lista de procesos.
+
+  **b) Excluir el esquema ilegible.** Perderás esos datos en la prueba:
+
+  ```bash
+  DB_DUMP_EXTRA_ARGS="-N service_catalog"
+  ```
+
+  **c) Pedir al DBA un GRANT de solo lectura en producción.** El script no lo
+  hace por ti porque escribiría en producción:
+
+  ```sql
+  GRANT USAGE  ON SCHEMA <esquema>                TO <usuario_app>;
+  GRANT SELECT ON ALL TABLES    IN SCHEMA <esquema> TO <usuario_app>;
+  GRANT SELECT ON ALL SEQUENCES IN SCHEMA <esquema> TO <usuario_app>;
+  ```
+
+Con `DB_DUMP_ROLE` puedes forzar el rol: `auto` (por defecto), `app` o `postgres`.
+
+### RoleBindings que no se migran
+
+OpenShift crea solo los RoleBindings `admin`, `system:deployers`,
+`system:image-builders` y `system:image-pullers` en cada namespace nuevo. El
+script **no** los migra: copiar el `admin` de producción daría permisos de
+administrador sobre el namespace de contingencia a los dueños del proyecto de
+producción. Si hace falta, se conceden a mano:
+
+```bash
+oc -n sanba-core-dr adm policy add-role-to-user admin <usuario>
+```
+
+Los RoleBindings propios de la aplicación sí se migran siempre. Para migrar
+también los por defecto: `MIGRATE_DEFAULT_ROLEBINDINGS="true"`.
+
+### `Warning: resource ... is missing the kubectl.kubernetes.io/last-applied-configuration annotation`
+
+Inofensivo. Aparece la primera vez que se hace `oc apply` sobre un recurso que
+el clúster había creado por su cuenta (los RoleBindings y ServiceAccounts que
+OpenShift genera al crear el namespace). `oc` añade la anotación y sigue.
+
+### `Warning: apps.openshift.io/v1 DeploymentConfig is deprecated in v4.14+`
+
+También inofensivo en 4.18: los DeploymentConfig siguen funcionando. Es un aviso
+de que Red Hat recomienda migrar a `Deployment` en el futuro, no un fallo de
+esta migración.
+
+---
+
 ## Decisiones de implementación
 
 Puntos donde una migración ingenua rompe la aplicación, y cómo se resuelven:
@@ -330,6 +408,12 @@ Puntos donde una migración ingenua rompe la aplicación, y cómo se resuelven:
   y además menciona un namespace.
 - **RoleBindings entre namespaces**: se reescribe el `namespace` de los subjects,
   para que `sanba-core-dr` siga pudiendo leer `location-resources-dr`.
+- **RoleBindings por defecto de OpenShift** (`admin`, `system:deployers`,
+  `system:image-builders`, `system:image-pullers`) no se migran: el destino los
+  crea solos, y copiar el `admin` de producción daría permisos de administrador
+  en contingencia a los dueños del proyecto de producción.
+- **El rol de `pg_dump` se elige comprobando permisos antes de volcar**, para no
+  descubrir a los diez minutos que una secuencia era ilegible.
 - **Services**: se quitan `clusterIP`, `clusterIPs`, `ipFamilies` y `nodePort`,
   que son propiedad del clúster de origen.
 - **PVCs**: se quitan `volumeName` y las anotaciones del provisionador.
