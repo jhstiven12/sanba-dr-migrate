@@ -359,7 +359,8 @@ MSG
     warn "pg_restore se ejecuta con --clean: BORRARÁ los objetos existentes en la BD de $dst_ns"
   fi
 
-  log "  pg_restore ${clean_flags:-(sin --clean, no borra nada)}"
+  log "  pg_restore ${clean_flags:-(sin --clean, no borra nada)} — $(du -h "$dump" | cut -f1) de volcado, puede tardar varios minutos sin mostrar salida"
+  local t0=$SECONDS
   set +e
   oc_dst exec -n "$dst_ns" "$dst_pod" -- bash -c \
     "PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" pg_restore -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" \
@@ -369,6 +370,7 @@ MSG
   set -e
   oc_dst exec -n "$dst_ns" "$dst_pod" -- rm -rf "$DB_REMOTE_DIR" >/dev/null 2>&1 || true
 
+  log "  pg_restore terminó en $((SECONDS - t0))s"
   local errs; errs=$(grep -ci '^pg_restore: error' "$RUN/db/restore.log" 2>/dev/null) || errs=0
   if (( rc != 0 || errs > 0 )); then
     # Con --clean son habituales los errores por objetos inexistentes o por no ser

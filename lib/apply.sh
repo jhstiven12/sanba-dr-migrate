@@ -176,11 +176,30 @@ cmd_apply() {
 
     # La restauración va justo después de que la BD esté lista y ANTES de que
     # arranque el backend, para que no encuentre un esquema vacío.
+    #
+    # Se ejecuta en una subshell a propósito: si algo falla dentro, un 'die'
+    # terminaría el script entero y dejaría el resto de namespaces sin
+    # desplegar. Aquí se avisa y se sigue: es preferible un drill completo con
+    # la base de datos pendiente que medio entorno sin crear.
     if [[ "$s" == "$DB_NS" && "$DB_MIGRATE" == true && "${SKIP_DB:-false}" != true && -z "${ONLY_NS:-}" ]]; then
-      cmd_db_migrate
+      if ( cmd_db_migrate ); then
+        DB_STEP_OK=true
+      else
+        DB_STEP_OK=false
+        warn "La carga de datos no se completó. Se continúa desplegando el resto."
+        todo "Repite la carga:  $0 db-migrate --run $RUN_ID"
+        todo "Y después reinicia el backend, que habrá arrancado contra una base vacía."
+      fi
     fi
   done
 
   step "Apply terminado"
-  ok "Ejecuta ahora: $0 validate --run $RUN_ID"
+  if [[ "${DB_STEP_OK:-true}" != true ]]; then
+    warn "Los namespaces están desplegados, pero la base de datos NO se cargó"
+    log  "  1) $0 db-migrate --run $RUN_ID"
+    log  "  2) oc -n <namespace-del-backend> rollout restart deployment,deploymentconfig --all"
+    log  "  3) $0 validate --run $RUN_ID"
+  else
+    ok "Ejecuta ahora: $0 validate --run $RUN_ID"
+  fi
 }
