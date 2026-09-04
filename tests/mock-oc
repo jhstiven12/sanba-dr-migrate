@@ -22,6 +22,55 @@ if [[ "$ALL" == *"rsync"* ]]; then
   [[ -n "${dest:-}" ]] && { mkdir -p "$dest"; echo "DUMP-SIMULADO" > "$dest/sanba.dump"; }
   exit 0
 fi
+# --- inventario simulado de los namespaces de contingencia -------------------
+# Sirve para probar la validación de la asociación entre namespaces sin clúster.
+ns=""
+prev=""
+for a in "$@"; do [[ "$prev" == "-n" ]] && ns="$a"; prev="$a"; done
+
+if [[ "$ALL" == *"get service -o json"* ]]; then
+  case "$ns" in
+    location-resources-dr)     echo '{"items":[{"metadata":{"name":"config"}},{"metadata":{"name":"core-alias"}}]}' ;;
+    sanba-core-dr)             echo '{"items":[{"metadata":{"name":"sanba-core"}}]}' ;;
+    sanba-gui-dr)              echo '{"items":[{"metadata":{"name":"sanba-gui"}}]}' ;;
+    sanba-data-persistence-dr) echo '{"items":[{"metadata":{"name":"postgresql"}}]}' ;;
+    *)                         echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
+if [[ "$ALL" == *"get endpoints -o json"* ]]; then
+  case "$ns" in
+    location-resources-dr)     echo '{"items":[{"metadata":{"name":"config"},"subsets":[{"addresses":[{"ip":"10.1.0.1"}]}]}]}' ;;
+    sanba-core-dr)             echo '{"items":[{"metadata":{"name":"sanba-core"},"subsets":[{"addresses":[{"ip":"10.1.0.2"}]}]}]}' ;;
+    sanba-gui-dr)              echo '{"items":[{"metadata":{"name":"sanba-gui"},"subsets":[{"addresses":[{"ip":"10.1.0.3"}]}]}]}' ;;
+    sanba-data-persistence-dr) echo '{"items":[{"metadata":{"name":"postgresql"},"subsets":[{"addresses":[{"ip":"10.1.0.4"}]}]}]}' ;;
+    *)                         echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
+if [[ "$ALL" == *"get rolebinding -o json"* ]]; then
+  [[ "$ns" == "location-resources-dr" ]] \
+    && echo '{"items":[{"metadata":{"name":"core-can-read"},"roleRef":{"name":"config-reader"},"subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core-dr"}]}]}' \
+    || echo '{"items":[]}'
+  exit 0
+fi
+if [[ "$ALL" == *"get networkpolicy -o json"* ]]; then
+  [[ "$ns" == "location-resources-dr" ]] \
+    && echo '{"items":[{"metadata":{"name":"allow-app"},"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"sanba-core-dr"}}}]}]}}]}' \
+    || echo '{"items":[]}'
+  exit 0
+fi
+if [[ "$ALL" == *"get configmap,secret,deployment"* ]]; then
+  case "$ns" in
+    location-resources-dr) echo '{"items":[{"kind":"ConfigMap","metadata":{"name":"endpoints"},"data":{"core":"http://sanba-core.sanba-core-dr.svc:8080","db":"postgresql.sanba-data-persistence-dr.svc"}}]}' ;;
+    sanba-core-dr)         echo '{"items":[{"kind":"ConfigMap","metadata":{"name":"sanba-core-config"},"data":{"LOC_URL":"http://config.location-resources-dr.svc/api","GUI":"http://sanba-gui.sanba-gui-dr.svc:8080"}}]}' ;;
+    sanba-gui-dr)          echo '{"items":[{"kind":"Deployment","metadata":{"name":"sanba-gui"},"spec":{"template":{"spec":{"containers":[{"name":"web","env":[{"name":"API","value":"http://sanba-core.sanba-core-dr.svc:8080"}]}]}}}}]}' ;;
+    *)                     echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
+if [[ "$ALL" == *"get sa sanba-core-sa"* ]]; then exit 0; fi
+
 [[ "$ALL" == *"get pods -o json"* ]] && { echo '{"items":[{"metadata":{"name":"pg-1-abcde"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]},"spec":{"containers":[{"image":"registry.redhat.io/rhel8/postgresql-10"}]}}]}'; exit 0; }
 [[ "$ALL" == *"get pvc -o json"* ]] && { echo '{"items":[{"metadata":{"name":"data"},"status":{"phase":"Bound"}}]}'; exit 0; }
 [[ "$ALL" == *"get sa default -o json"* ]] && { echo '{"imagePullSecrets":[{"name":"default-dockercfg-zzzzz"}]}'; exit 0; }

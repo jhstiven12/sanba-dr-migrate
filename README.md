@@ -16,7 +16,50 @@ clústeres. No se instala nada en los clústeres.
 
 Migra ServiceAccounts (con sus SCC y RoleBindings, incluidos los que cruzan
 namespaces), ConfigMaps, Secrets, PVCs, Services, Routes, workloads y los datos
-de la base de datos.
+de la base de datos, **reescribiendo las URLs** para que ningún componente de
+contingencia siga llamando a producción.
+
+## Empezar por aquí
+
+```bash
+./sanba-dr.sh
+```
+
+Es la consola de operación: pide el token de **producción** y el del entorno de
+**pre-producción (DR)**, comprueba que son dos clústeres distintos y presenta un
+menú con las tareas del plan. Cada opción llama por debajo a
+`sanba-dr-migrate.sh`, que es quien hace el trabajo.
+
+```
+ PROD (origen)  https://api.prod:6443                    usuario: dr-operator
+ DR (destino)   https://api.preprod:6443                 usuario: dr-operator
+ NAMESPACES     location-resources sanba-data-persistence sanba-core sanba-gui  sufijo: -dr
+ CORRIDA        20260904-181500                          modo: escritura
+==============================================================================
+  PREPARACIÓN
+    1) Preflight — host, sesiones, permisos, namespaces y StorageClasses
+    2) Export    — extraer producción a out/<corrida>/raw  (SOLO LECTURA)
+    3) Transform — sanear, renombrar namespaces y reescribir las URLs
+    4) Revisar informes de la corrida
+
+  DESPLIEGUE EN CONTINGENCIA
+    5) Mirror    — copiar las imágenes por digest al registry de pre-producción
+    6) Apply     — desplegar en pre-producción (encadena la carga de datos)
+    7) Db-migrate— cargar los datos PostgreSQL por separado
+    8) Validate  — comprobar rollouts, pods, PVCs, URLs, BD, SA y configuración
+  ...
+```
+
+El token se pide con el eco apagado y admite pegar la línea completa que da la
+consola web (*tu usuario → Copy login command*): la consola extrae el token y la
+URL de la API. **El token no se muestra, no se escribe en la bitácora y no queda
+en el historial**: acaba solo en el kubeconfig correspondiente, con permisos
+`600`. Las opciones destructivas (`apply`, `db-migrate`, `rollback`) piden
+confirmación escrita antes de tocar nada.
+
+Todo lo que hace la consola se puede seguir haciendo a mano con
+`./sanba-dr-migrate.sh <subcomando>`, que es lo que documentan los pasos de más
+abajo y lo que debes usar para automatizar.
 
 ---
 
@@ -68,6 +111,50 @@ revisarlo antes de seguir.
 
 ---
 
+## Cómo se lee la bitácora
+
+La salida está pensada para seguir un drill en directo y para poder auditarlo
+después. Tiene tres planos:
+
+```
+==============================================================================
+ FASE 3/5  TRANSFORM — Saneo, renombrado de namespaces y reescritura de URLs
+ inicio 2026-09-04 18:15:02 · corrida 20260904-181500 · modo escritura...
+==============================================================================
+18:15:02  PASO  1/15    Mapa de URLs de los componentes
+18:15:02  INFO    hosts de Route deducidos: 2
+18:15:02  OK    3 sustituciones de URL activas (mapa en out/.../url-map.tsv)
+          · paso 1/15 OK  (1 OK · 0 avisos · 0 fallos · 0s)
+...
+------------------------------------------------------------------------------
+ FASE TRANSFORM  CON AVISOS  ·  15 pasos · 22 OK · 3 avisos · 0 fallos · 00:11
+------------------------------------------------------------------------------
+```
+
+- **FASE** — un pase completo del plan (`preflight`, `export`, `transform`,
+  `apply`, `db-migrate`, `validate`, `mirror`, `rollback`). Lleva su número
+  dentro del plan, la hora de inicio, la corrida y si se está simulando.
+- **PASO** — cada tarea dentro de la fase, numerada sobre el total previsto.
+  Al cerrarse imprime su estado (`OK`, `CON AVISOS`, `CON FALLOS`) y cuánto tardó.
+- **Línea** — el detalle: `INFO`, `OK`, `WARN`, `FAIL`, `DBG` (solo con `-v`).
+
+Al final de cada ejecución se imprime el cuadro de resumen:
+
+```
+ FASE         ESTADO        PASOS    OK  AVISOS  FALLOS   TIEMPO
+ PREFLIGHT    COMPLETADA       10    24       1       0    00:19
+ EXPORT       COMPLETADA        6    11       0       0    00:41
+ TRANSFORM    CON AVISOS       15    22       3       0    00:11
+ DB-MIGRATE   COMPLETADA        6     7       0       0    04:52
+ APPLY        COMPLETADA        6    14       0       0    03:07
+ VALIDATE     CON AVISOS       11    38       2       0    01:04
+```
+
+Todo eso queda también en `out/<run>/migrate.log`, **sin códigos de color**, para
+poder adjuntarlo al informe del drill o pasarle `grep`.
+
+---
+
 ## Paso 0 — Preparar el host RHEL 9
 
 ```bash
@@ -101,7 +188,8 @@ oc version --client        # debe decir 4.18.x
 
 ## Paso 1 — Iniciar sesión en los dos clústeres
 
-Cada clúster tiene su propio token, así que cada uno usa su propio kubeconfig:
+Con la consola (`./sanba-dr.sh`) esto ya está resuelto: pide los dos tokens al
+arrancar. A mano, cada clúster tiene su propio token y su propio kubeconfig:
 
 ```bash
 KUBECONFIG=~/.kube/config-prod    oc login https://api.<prod>:6443    --token=sha256~...
@@ -159,7 +247,8 @@ por coma) en vez de una por tipo de recurso. Deja los objetos crudos en
 
 Sanea los manifiestos, renombra los namespaces —también dentro del contenido de
 ConfigMaps, Secrets, variables de entorno y argumentos—, recalcula los hostnames
-de las Routes y genera los informes en `out/<run>/`.
+de las Routes, **reescribe las URLs de los componentes** (ver más abajo) y genera
+los informes en `out/<run>/`.
 
 ## Paso 6 — REVISAR (no lo saltes)
 
@@ -175,6 +264,103 @@ de las Routes y genera los informes en `out/<run>/`.
 | `reports/serviceaccounts.txt` | Cada SA con sus SCC, su origen y los workloads que la usan. |
 | `reports/config.txt` | ConfigMaps y Secrets, número de claves y quién los consume. |
 | `reports/ns-rewrites.txt` | Qué claves contenían un nombre de namespace y fueron reescritas. |
+| `reports/urls.txt` | Qué URL tiene ahora cada componente y cuáles se quedaron **SIN RESOLVER**. |
+| `reports/cross-namespace.txt` | Quién llama a qué servicio de qué namespace, el RBAC cruzado y los selectores de red. |
+
+### URLs de los componentes
+
+El renombrado de namespace arregla las URLs **internas**
+(`postgresql.sanba-data-persistence.svc` → `...-dr.svc`), pero no las
+**externas**: un ConfigMap que apunte a
+`https://sanba-gui-sanba-gui.apps.prod.example.com` seguiría llamando a
+**producción** desde el entorno de contingencia, y el drill sería falso aunque
+todos los pods estuvieran `Ready`.
+
+`transform` construye `out/<run>/url-map.tsv` con tres fuentes y aplica siempre
+la **coincidencia más larga primero**:
+
+| Prioridad | Fuente | Ejemplo |
+|---|---|---|
+| 1 | `url-map.txt` — pares que declaras tú | `https://api-pagos.corp.example.com` → `https://api-pagos-qa.corp.example.com` |
+| 2 | Hosts de las Routes migradas, deducidos del apps-domain de cada clúster | `sanba-gui-sanba-gui.apps.prod...` → `sanba-gui-sanba-gui-dr.apps.preprod...` |
+| 3 | El apps-domain como red de seguridad (`REWRITE_APPS_DOMAIN`) | `apps.prod.example.com` → `apps.preprod.example.com` |
+
+La sustitución es literal (no es una expresión regular) y alcanza a:
+
+- `data` de **ConfigMaps**,
+- `data` de **Secrets** — solo los valores base64 que descodifican a texto UTF-8
+  y vuelven a codificar idénticos: las claves privadas, keystores y binarios
+  nunca se tocan,
+- `env`, `args` y `command` de todos los workloads.
+
+Lo que **no** se puede deducir —un host custom que no sigue
+`<route>-<namespace>.<apps-domain>`— se declara a mano:
+
+```
+# url-map.txt
+https://sanba.corp.example.com      https://sanba-dr.corp.example.com
+ldap://ldap.corp.example.com:389    ldap://ldap-dr.corp.example.com:389
+```
+
+Después de cada `transform`, `reports/urls.txt` dice qué URL tiene ahora cada
+objeto y marca **`SIN RESOLVER`** lo que se haya quedado apuntando a producción;
+eso mismo aparece como `FAIL` en la traza y como pendiente en
+`manual-todo.txt`. La comprobación se repite en `validate`, pero contra lo que
+de verdad quedó **desplegado en el clúster** de contingencia.
+
+Desde la consola, la opción **11) URLs de los componentes** enseña el mapa y el
+informe, y abre `url-map.txt` para editarlo.
+
+### Asociación entre los namespaces
+
+Los cuatro namespaces no son independientes: el backend lee la configuración de
+`location-resources`, habla con la base de datos y el GUI llama al backend. Esas
+relaciones están escritas como nombres DNS `<servicio>.<namespace>.svc`, como
+RoleBindings que cruzan de un namespace a otro y como `namespaceSelector` en las
+NetworkPolicies. Si alguna se queda a medio traducir, el entorno de contingencia
+arranca **verde pero desconectado**, o peor: llamando a producción.
+
+**La regla del FQDN.** En `<servicio>.<namespace>.svc` el namespace es la
+etiqueta que precede a `.svc`. El nombre del servicio **no cambia**, porque este
+script no renombra objetos:
+
+```
+postgresql.sanba-data-persistence.svc  ->  postgresql.sanba-data-persistence-dr.svc
+sanba-core.sanba-core.svc              ->  sanba-core.sanba-core-dr.svc
+^^^^^^^^^^ el Service se sigue llamando 'sanba-core' dentro de sanba-core-dr
+```
+
+Es el caso que más se da —un Service con el mismo nombre que su namespace— y el
+que más silenciosamente rompe: `sanba-core-dr.sanba-core-dr.svc` no resuelve.
+
+Se traducen además:
+
+| Dónde | Ejemplo |
+|---|---|
+| `spec.externalName` de un Service `ExternalName` | alias a otro namespace de la aplicación |
+| `namespaceSelector` de las NetworkPolicies (`matchLabels` y `matchExpressions`) | `kubernetes.io/metadata.name: sanba-core` → `sanba-core-dr` |
+| `subjects[].namespace` de RoleBindings y ClusterRoleBindings | la SA `sanba-core-sa` pasa a `sanba-core-dr` |
+| Anotaciones de objetos y de la plantilla de pod | URLs y nombres de namespace |
+
+Y `transform` lo **verifica antes de aplicar nada**, dejando el resultado en
+`reports/cross-namespace.txt`:
+
+```
+DEPENDENCIAS DNS  (quién llama a qué servicio de qué namespace)
+NAMESPACE(DR)       OBJETO                        CAMPO       SERVICIO DESTINO                   ESTADO
+sanba-core-dr       ConfigMap/sanba-core-config   data.LOC_URL  config.location-resources-dr.svc   OK
+sanba-core-dr       Deployment/sanba-core         ...args.1     config.location-resources-dr.svc   OK
+sanba-gui-dr        Deployment/sanba-gui          ...env.0      sanba-core.sanba-core-dr.svc       OK
+
+RBAC CRUZADO  (a qué ServiceAccount de otro namespace se le concede acceso)
+location-resources-dr  core-can-read  sanba-core-sa  sanba-core-dr  CRUZADO (correcto)
+```
+
+Cada dependencia se marca como `OK`, `SIN TRADUCIR (apunta a PRODUCCIÓN)` o
+`SERVICE INEXISTENTE`; las dos últimas salen como `FAIL` en la traza y como
+pendiente en `manual-todo.txt`. `validate` repite la comprobación contra el
+clúster, exigiendo además que el Service tenga **endpoints** —es decir, que
+haya algún pod detrás.
 
 ### Imágenes
 
@@ -284,6 +470,11 @@ Informe completo en `out/<run>/reports/validation.txt`:
 6. Base de datos: `select 1`, conectividad desde `sanba-core-dr` y diff de filas
 7. ServiceAccounts existentes y con las mismas SCC que en producción
 8. ConfigMaps y Secrets con las mismas claves (solo claves, nunca valores)
+9. Que ningún ConfigMap, Secret ni variable de entorno **desplegado** siga apuntando a producción
+10. **Asociación entre namespaces**: cada dependencia `<servicio>.<namespace>-dr.svc`
+    declarada en la configuración existe como Service y tiene endpoints; el RBAC
+    cruzado apunta a las ServiceAccounts de los namespaces `-dr`; y los
+    `namespaceSelector` de las NetworkPolicies seleccionan namespaces `-dr`
 
 ### Criterios de éxito
 
@@ -291,6 +482,9 @@ Informe completo en `out/<run>/reports/validation.txt`:
 - Todas las Routes de `sanba-gui-dr` aparecen como `OK` en la tabla de URLs.
 - `out/<run>/db/rowcounts.diff` está vacío.
 - Cada SA tiene en contingencia las mismas SCC que en producción.
+- Ninguna dependencia entre namespaces aparece como `SIN TRADUCIR` ni como
+  `SERVICE INEXISTENTE`: el backend lee de `location-resources-dr`, no de
+  `location-resources`.
 - Y a mano: login en la GUI y una transacción de negocio de extremo a extremo.
 
 ## Paso 10 — Repetir el drill
@@ -501,22 +695,29 @@ bash tests/smoke.sh        # exit 0 si todo pasa
 ```
 
 Comprueba sintaxis, que todas las funciones invocadas existen, el pipeline con
-manifiestos YAML y JSON, `db-migrate` de extremo a extremo (incluida la escalada
-al superusuario por socket local) y que el guardarraíl rechaza los verbos de
-escritura sobre producción.
+manifiestos YAML y JSON, la reescritura de URLs en ConfigMaps, Secrets y
+variables de entorno (incluido que el binario de un Secret no se corrompe y que
+una URL sin equivalente se marca como pendiente), la asociación entre namespaces
+(FQDN internos, ExternalName, NetworkPolicies y RBAC cruzado, más la validación
+en caliente contra el `oc` simulado), `db-migrate` de extremo a
+extremo (incluida la escalada al superusuario por socket local) y que el
+guardarraíl rechaza los verbos de escritura sobre producción.
 
 ## Estructura
 
 ```
+sanba-dr.sh              consola interactiva: pide los tokens y ofrece el menú de tareas
 sanba-dr-migrate.sh      orquestador
 sanba-dr.env             parámetros
+url-map.txt              sustituciones de URL para los ConfigMaps y Secrets
 route-map.txt            mapeo opcional de hosts custom
 lib/                     common, preflight, export, transform, images, apply, database, validate
 tests/                   smoke.sh, mock-oc y fixtures.py (pruebas sin clúster)
 out/<run>/
   raw/                   objetos crudos de producción
   clean/                 manifiestos listos para aplicar
-  reports/               informes
+  reports/               informes (incluye urls.txt y cross-namespace.txt)
+  url-map.tsv            sustituciones de URL aplicadas en esta corrida
   db/                    volcado, conteos de filas y su diff
   discovered.env         parámetros descubiertos en producción
   mirror-commands.sh     comandos de mirror (generados, no ejecutados)

@@ -300,8 +300,162 @@ v_config() {
   done
 }
 
+# 9. URLs dentro de ConfigMaps, Secrets y variables de entorno
+#
+# Comprueba lo que de verdad quedó EN EL CLÚSTER de contingencia: si algún
+# componente conserva una URL de producción, la prueba de DR es falsa aunque
+# todos los pods estén Ready. De los Secrets solo se mira el valor descodificado
+# en memoria; al informe solo va el nombre de la clave.
+v_config_urls() {
+  vsec "URLs de producción dentro de la configuración desplegada"
+  local s d srcdom froms filtro n_bad=0
+
+  if [[ ! -r "$RUN/domain-src.txt" ]]; then
+    vwarn "No hay domain-src.txt en esta corrida: no se puede comprobar el dominio de producción"
+    return 0
+  fi
+  srcdom="$(cat "$RUN/domain-src.txt")"
+
+  # Patrones a buscar: el apps-domain de PROD, el lado izquierdo del mapa de
+  # URLs y los hosts de PROD que 'transform' no pudo traducir.
+  froms=$( { cut -f1 "$RUN/url-map.tsv" 2>/dev/null
+             cat "$RUN/.url-unmapped.txt" 2>/dev/null; } | grep -v '^$' || true)
+  filtro=$(printf '%s\n%s\n' "$srcdom" "$froms" | grep -v '^$' | sort -u | jq -R . | jq -s -c .)
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    while IFS=$'\t' read -r kind name key hit; do
+      [[ -z "${name:-}" ]] && continue
+      vfail "$d $kind/$name clave '$key' apunta todavía a producción ('$hit')"
+      todo "$d: $kind/$name clave '$key' conserva '$hit'. Añade el par correcto a ${URL_MAP_FILE:-url-map.txt}, repite 'transform' y vuelve a aplicar."
+      n_bad=$((n_bad+1))
+    done < <(oc_dst -n "$d" get configmap,secret,deployment,deploymentconfig,statefulset,daemonset -o json 2>/dev/null \
+      | jq -r --argjson pats "$filtro" '
+          .items[]
+          | .kind as $k | .metadata.name as $n
+          | select($n | IN("kube-root-ca.crt","openshift-service-ca.crt") | not)
+          | ( ( (.data // {}) | to_entries[]
+                | {key: .key,
+                   v: (if $k == "Secret" then ((try (.value | @base64d) catch "") // "") else (.value // "") end)} ),
+              ( ((.spec.template.spec // {}) | (.containers // []) + (.initContainers // []))[]
+                | ( ((.env // [])[] | select(has("value")) | {key: ("env/" + .name), v: (.value // "")}),
+                    ((.args // [])[] | {key: "args", v: .}),
+                    ((.command // [])[] | {key: "command", v: .}) ) ) )
+          | select(.v | type == "string")
+          | . as $e
+          | $pats[] | . as $p
+          | select($p | length > 0)
+          | select($e.v | contains($p))
+          | [$k, $n, $e.key, $p] | @tsv')
+  done
+
+  if (( n_bad == 0 )); then
+    vok "Ningún ConfigMap, Secret ni variable de entorno del entorno de contingencia apunta a producción"
+  fi
+  [[ -r "$REPORTS/urls.txt" ]] && vraw "  Mapa completo de URLs: $REPORTS/urls.txt"
+  return 0
+}
+
+# 10. Asociación entre namespaces, comprobada sobre el clúster
+#
+# El equivalente en caliente de tf_cross_refs: que cada dependencia
+# <servicio>.<namespace>-dr.svc que la configuración desplegada declara exista
+# de verdad, tenga endpoints, y que el RBAC y las NetworkPolicies apunten a los
+# namespaces de contingencia y no a los de producción.
+v_cross_namespace() {
+  vsec "Asociación entre los namespaces de contingencia"
+  local s d ns_re svcs="$RUN/.live-svcs.tsv" eps="$RUN/.live-eps.tsv"
+  : > "$svcs"; : > "$eps"
+
+  ns_re=""
+  for s in $(src_namespaces); do ns_re+="${ns_re:+|}$(ns_dst "$s")"; done
+  for s in $(src_namespaces); do ns_re+="|$s"; done
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    oc_dst -n "$d" get service -o json 2>/dev/null \
+      | jq -r --arg d "$d" '.items[] | [$d, .metadata.name] | @tsv' >> "$svcs"
+    oc_dst -n "$d" get endpoints -o json 2>/dev/null \
+      | jq -r --arg d "$d" '.items[] | [$d, .metadata.name,
+          ([.subsets[]?.addresses[]?] | length | tostring)] | @tsv' >> "$eps"
+  done
+
+  local vistos=0
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+
+    # --- dependencias DNS declaradas en la configuración desplegada ---------
+    while IFS=$'\t' read -r kind name campo svc tns; do
+      [[ -z "${svc:-}" ]] && continue
+      vistos=$((vistos+1))
+      if [[ "$tns" != *"$DR_SUFFIX" ]]; then
+        vfail "$d $kind/$name ($campo) apunta a ${svc}.${tns}.svc, el namespace de PRODUCCIÓN"
+        todo "$d: $kind/$name ($campo) apunta a producción (${svc}.${tns}.svc). Repite 'transform' y vuelve a aplicar."
+      elif ! awk -F'\t' -v n="$tns" -v x="$svc" '$1==n && $2==x {f=1} END{exit !f}' "$svcs"; then
+        vfail "$d $kind/$name ($campo) apunta a ${svc}.${tns}.svc, pero ese Service no existe en $tns"
+        todo "$d: falta el Service '$svc' en '$tns'; ${kind}/${name} no podrá resolverlo."
+      elif [[ "$(awk -F'\t' -v n="$tns" -v x="$svc" '$1==n && $2==x {print $3}' "$eps")" == "0" ]]; then
+        vwarn "$d $kind/$name ($campo) -> ${svc}.${tns}.svc existe pero no tiene endpoints (ningún pod listo detrás)"
+      else
+        vok "$d $kind/$name ($campo) -> ${svc}.${tns}.svc resuelve y tiene endpoints"
+      fi
+    done < <(oc_dst -n "$d" get configmap,secret,deployment,deploymentconfig,statefulset,daemonset -o json 2>/dev/null \
+      | jq -r --arg re "([A-Za-z0-9][A-Za-z0-9_-]*)\\.($ns_re)\\.svc" '
+          .items[] as $o
+          | select($o.metadata.name | IN("kube-root-ca.crt","openshift-service-ca.crt") | not)
+          | ($o | paths(strings)) as $p
+          | ($o | getpath($p)) as $raw
+          | (if ($o.kind == "Secret") and ($p[0] == "data")
+             then ((try ($raw | @base64d) catch "") // "") else $raw end) as $v
+          | select($v | type == "string")
+          | $v | [match($re; "g")][]
+          | [$o.kind, $o.metadata.name, ($p | map(tostring) | join(".")),
+             .captures[0].string, .captures[1].string] | @tsv' | sort -u)
+
+    # --- RBAC: ninguna concesión puede seguir apuntando a producción --------
+    while IFS=$'\t' read -r bind sa sans; do
+      [[ -z "${sa:-}" ]] && continue
+      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+        vfail "$d rolebinding/$bind concede permisos a la SA '$sa' del namespace de PRODUCCIÓN '$sans'"
+      elif [[ "$sans" != "$d" ]]; then
+        if oc_dst -n "$sans" get sa "$sa" >/dev/null 2>&1; then
+          vok "$d rolebinding/$bind concede acceso a $sa de $sans (asociación cruzada correcta)"
+        else
+          vfail "$d rolebinding/$bind apunta a la SA '$sa' de '$sans', que no existe"
+        fi
+      fi
+    done < <(oc_dst -n "$d" get rolebinding -o json 2>/dev/null | jq -r --arg d "$d" '
+        .items[] | select(.metadata.name | startswith("system:") | not)
+        | .metadata.name as $n | ((.subjects // [])[])
+        | select(.kind == "ServiceAccount")
+        | [$n, .name, (.namespace // $d)] | @tsv')
+
+    # --- NetworkPolicy: los selectores deben elegir namespaces -dr ----------
+    while IFS=$'\t' read -r name valor; do
+      [[ -z "${valor:-}" ]] && continue
+      if [[ "$valor" != *"$DR_SUFFIX" ]]; then
+        vfail "$d networkpolicy/$name selecciona el namespace '$valor', que no es de contingencia: el tráfico quedará bloqueado"
+        todo "$d: networkpolicy/$name selecciona '$valor'. Debe seleccionar '$(ns_dst "$valor")'."
+      else
+        vok "$d networkpolicy/$name selecciona correctamente '$valor'"
+      fi
+    done < <(oc_dst -n "$d" get networkpolicy -o json 2>/dev/null | jq -r --arg re "^($ns_re)\$" '
+        .items[] | .metadata.name as $n
+        | [ .. | objects | select(has("namespaceSelector")) | .namespaceSelector
+            | ((.matchLabels // {}) | to_entries[] | .value),
+              ((.matchExpressions // [])[] | (.values // [])[]) ]
+        | .[] | select(test($re)) | [$n, .] | @tsv' | sort -u)
+  done
+
+  rm -f "$svcs" "$eps"
+  (( vistos == 0 )) && vwarn "No se encontró ninguna dependencia DNS entre namespaces en la configuración desplegada"
+  [[ -r "$REPORTS/cross-namespace.txt" ]] && vraw "  Mapa de dependencias: $REPORTS/cross-namespace.txt"
+  return 0
+}
+
 cmd_validate() {
   require_cmd oc jq curl
+  phase_steps 12
   [[ -d "$RUN" ]] || die "No existe la corrida $RUN_ID"
   {
     echo "Validación de la prueba de DR de SANBA"
@@ -318,6 +472,8 @@ cmd_validate() {
   v_database
   v_serviceaccounts
   v_config
+  v_config_urls
+  v_cross_namespace
 
   vsec "Resumen"
   vraw "  Comprobaciones OK : $V_OK"

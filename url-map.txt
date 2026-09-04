@@ -1,0 +1,25 @@
+# Sustituciones literales de URL para el entorno de contingencia.
+#
+#   <valor-en-PRODUCCIÓN>    <valor-en-CONTINGENCIA>
+#
+# Se aplican al CONTENIDO de ConfigMaps, Secrets (valores base64 que son
+# texto), variables de entorno, args y command de todos los workloads. Es una
+# sustitución literal de texto, no una expresión regular, y siempre gana la
+# coincidencia más larga.
+#
+# NO hace falta declarar aquí:
+#   - las URLs internas <svc>.<namespace>.svc[.cluster.local]: el renombrado de
+#     namespace ya las convierte a <svc>.<namespace>-dr.svc
+#   - los hosts de las Routes que migra este script: se deducen solos del
+#     apps-domain de cada clúster (mira out/<run>/url-map.tsv)
+#
+# Sí hace falta declarar aquí:
+#   - hosts custom que no siguen el patrón <route>-<namespace>.<apps-domain>
+#   - sistemas externos con endpoint distinto en contingencia: pasarelas de
+#     pago, LDAP, colas, SFTP, APIs de terceros, balanceadores...
+#
+# Ejemplos (borra o adapta):
+# https://sanba.corp.example.com          https://sanba-dr.corp.example.com
+# ldap://ldap.corp.example.com:389        ldap://ldap-dr.corp.example.com:389
+# jdbc:oracle:thin:@ora-prod:1521/SANBA   jdbc:oracle:thin:@ora-dr:1521/SANBA
+# https://api-pagos.corp.example.com      https://api-pagos-qa.corp.example.com

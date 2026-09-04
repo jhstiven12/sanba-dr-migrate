@@ -221,7 +221,8 @@ cmd_db_migrate() {
   [[ "${DB_MIGRATE:-true}" == true ]] || { log "DB_MIGRATE=false, se omite la migración de datos"; return 0; }
 
   local src_ns="$DB_NS" dst_ns; dst_ns="$(ns_dst "$DB_NS")"
-  step "Migración de datos PostgreSQL: $src_ns -> $dst_ns"
+  phase_steps 6
+  step "Origen: pod de PostgreSQL, credenciales y rol de volcado ($src_ns)"
 
   # Guarda dura: solo se restaura sobre el namespace de contingencia.
   [[ "$dst_ns" == *"$DR_SUFFIX" ]] \
@@ -271,6 +272,7 @@ MSG
       pg_user_expr='PGPASSWORD="$POSTGRESQL_PASSWORD" pg_dump -U "$POSTGRESQL_USER"' ;;
   esac
 
+  step "Origen: pg_dump (solo lectura sobre producción)"
   log "  pg_dump (formato custom, comprimido) en $DB_REMOTE_DIR"
   set +e
   oc_src exec -n "$src_ns" "$src_pod" -- bash -c \
@@ -298,6 +300,7 @@ MSG
   fi
   ok "pg_dump completado (traza en $RUN/db/pg_dump.log)"
 
+  step "Origen: descarga del volcado con oc rsync"
   # oc rsync: método documentado por Red Hat para bajar archivos de BD de un pod.
   mkdir -p "$RUN/db/incoming"
   oc_src rsync -n "$src_ns" "$src_pod:$DB_REMOTE_DIR/" "$RUN/db/incoming/" --no-perms >/dev/null 2>&1 \
@@ -318,6 +321,7 @@ MSG
   ok "Volcado: $dump ($(du -h "$dump" | cut -f1))"
 
   # ======================= DESTINO (pre-producción) =======================
+  step "Destino: comprobaciones previas y subida del volcado ($dst_ns)"
   local dst_pod; dst_pod=$(db_find_pod oc_dst "$dst_ns")
   [[ -n "$dst_pod" ]] || die "No se encontró un pod de PostgreSQL Running en $dst_ns. ¿Se aplicó ese namespace?"
   log "DESTINO:"
@@ -353,6 +357,7 @@ MSG
   oc_dstw rsync -n "$dst_ns" "$RUN/db/" "$dst_pod:$DB_REMOTE_DIR/" --no-perms --exclude='*.txt' --exclude='*.diff' --exclude='*.log' >/dev/null 2>&1 \
     || die "No se pudo subir el volcado a $dst_ns/$dst_pod"
 
+  step "Destino: pg_restore"
   local clean_flags=""
   if [[ "${DB_RESTORE_CLEAN:-false}" == true ]]; then
     clean_flags="--clean --if-exists"
@@ -382,6 +387,7 @@ MSG
   fi
 
   # ======================= verificación =======================
+  step "Verificación: conteo de filas origen vs destino"
   log "  conteo de filas en destino"
   db_rowcounts oc_dst "$dst_ns" "$dst_pod" "$RUN/db/rowcounts-dst.txt" "$dst_role"
 

@@ -4,8 +4,9 @@
 # de la base de datos.
 out/
 
-# Mapeo de hosts real (puede llevar DNS corporativo)
+# Mapeos reales (pueden llevar DNS y endpoints corporativos)
 route-map.local.txt
+url-map.local.txt
 
 # Configuración local con rutas a kubeconfig
 sanba-dr.local.env

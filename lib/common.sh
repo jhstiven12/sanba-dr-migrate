@@ -7,28 +7,195 @@
 _SANBA_COMMON_LOADED=1
 
 # ---------------------------------------------------------------------------
-# Colores y logging
+# Salida: bitácora de operación
+#
+#   HH:MM:SS  NIVEL  mensaje
+#
+# Tres planos de información, para que la corrida se lea igual en la consola
+# que en migrate.log:
+#   FASE  — un pase completo del plan de DR (preflight, export, apply...).
+#   PASO  — una tarea dentro de la fase; se numera y se cierra con su estado.
+#   línea — el detalle (INFO/OK/WARN/FAIL) que produce cada paso.
+#
+# El color se decide con SANBA_TTY, no con [[ -t 2 ]]: el script redirige
+# stderr a un 'tee' antes de cargar esta librería, así que en ese punto stderr
+# ya no es un terminal. migrate.log se escribe sin secuencias ANSI.
 # ---------------------------------------------------------------------------
-if [[ -t 2 ]]; then
-  C_RST=$'\e[0m'; C_RED=$'\e[1;31m'; C_YEL=$'\e[1;33m'
+if [[ "${SANBA_TTY:-$( [[ -t 2 ]] && echo true || echo false )}" == true ]]; then
+  C_RST=$'\e[0m';    C_RED=$'\e[1;31m'; C_YEL=$'\e[1;33m'
   C_GRN=$'\e[1;32m'; C_BLU=$'\e[1;34m'; C_DIM=$'\e[2m'
+  C_CYA=$'\e[1;36m'; C_BLD=$'\e[1m'
 else
-  C_RST=''; C_RED=''; C_YEL=''; C_GRN=''; C_BLU=''; C_DIM=''
+  C_RST=''; C_RED=''; C_YEL=''; C_GRN=''; C_BLU=''; C_DIM=''; C_CYA=''; C_BLD=''
 fi
 
 WARN_COUNT=0
 FAIL_COUNT=0
 
-_ts()  { date +'%H:%M:%S'; }
-log()  { printf '%s %s\n'    "${C_DIM}[$(_ts)]${C_RST}" "$*" >&2; }
-vlog() { [[ "${VERBOSE:-false}" == true ]] && printf '%s %s\n' "${C_DIM}[$(_ts)]   ·${C_RST}" "$*" >&2; return 0; }
-step() { printf '\n%s %s\n'  "${C_BLU}==>${C_RST}"      "$*" >&2; }
-ok()   { printf '  %s %s\n'  "${C_GRN}OK${C_RST}"       "$*" >&2; }
-warn() { printf '  %s %s\n'  "${C_YEL}WARN${C_RST}"     "$*" >&2; WARN_COUNT=$((WARN_COUNT+1)); }
-err()  { printf '  %s %s\n'  "${C_RED}FAIL${C_RST}"     "$*" >&2; FAIL_COUNT=$((FAIL_COUNT+1)); }
+# --- estado de la fase y del paso en curso ---------------------------------
+PHASE_TOTAL="${PHASE_TOTAL:-0}"   # fases planificadas en esta ejecución
+PHASE_INDEX=0                     # fase en curso
+PHASE_ID=""                       # etiqueta corta (EXPORT, APPLY...)
+PHASE_START=0
+PHASE_STEPS=0                     # pasos previstos en la fase (0 = desconocido)
+PHASE_OK=0; PHASE_WARN=0; PHASE_FAIL=0
+STEP_INDEX=0
+STEP_NAME=""
+STEP_START=0
+STEP_OK=0; STEP_WARN=0; STEP_FAIL=0
+PHASE_SUMMARY=()                  # "id|estado|pasos|ok|warn|fail|segundos"
+
+_ts()   { date +'%H:%M:%S'; }
+_now()  { date +'%Y-%m-%d %H:%M:%S'; }
+_dur()  { printf '%02d:%02d' $(( ${1:-0} / 60 )) $(( ${1:-0} % 60 )); }
+# tr no es multibyte: la regla se construye concatenando.
+_rule() { local ch="${1:--}" n="${2:-78}" s=''; while (( ${#s} < n )); do s+="$ch"; done; printf '%s' "$s"; }
+
+# _emit <color> <nivel> <mensaje...>
+_emit() {
+  local color="$1" level="$2"; shift 2
+  printf '%s%s%s  %s%-4s%s  %s\n' \
+    "$C_DIM" "$(_ts)" "$C_RST" "$color" "$level" "$C_RST" "$*" >&2
+}
+
+log()  { _emit "$C_BLU" "INFO" "$*"; }
+vlog() { [[ "${VERBOSE:-false}" == true ]] && _emit "$C_DIM" "DBG" "$*"; return 0; }
+ok()   { _emit "$C_GRN" "OK"   "$*"; STEP_OK=$((STEP_OK+1));     PHASE_OK=$((PHASE_OK+1)); }
+warn() { _emit "$C_YEL" "WARN" "$*"; STEP_WARN=$((STEP_WARN+1)); PHASE_WARN=$((PHASE_WARN+1)); WARN_COUNT=$((WARN_COUNT+1)); }
+err()  { _emit "$C_RED" "FAIL" "$*"; STEP_FAIL=$((STEP_FAIL+1)); PHASE_FAIL=$((PHASE_FAIL+1)); FAIL_COUNT=$((FAIL_COUNT+1)); }
+
 # Aborta con un mensaje propio. Marca _SANBA_DIED para que el trap de ERR no
 # añada encima una traza de "comando fallido": el motivo ya se ha explicado.
-die()  { _SANBA_DIED=1; printf '\n%s %s\n\n' "${C_RED}ABORTA:${C_RST}" "$*" >&2; exit 1; }
+die() {
+  _SANBA_DIED=1
+  STEP_FAIL=$((STEP_FAIL+1)); PHASE_FAIL=$((PHASE_FAIL+1)); FAIL_COUNT=$((FAIL_COUNT+1))
+  _step_close ABORTADO
+  printf '\n%s%s ABORTADA%s  %s\n\n' "$C_RED" "${PHASE_ID:-EJECUCIÓN}" "$C_RST" "$*" >&2
+  exit 1
+}
+
+# --- pasos ------------------------------------------------------------------
+_step_label() {
+  if (( PHASE_STEPS > 0 )); then printf '%d/%d' "$STEP_INDEX" "$PHASE_STEPS"
+  else printf '%d' "$STEP_INDEX"; fi
+}
+
+# Cierra el paso en curso imprimiendo su estado y cuánto tardó.
+_step_close() {
+  [[ -z "$STEP_NAME" ]] && return 0
+  local forced="${1:-}" estado color d=$(( SECONDS - STEP_START ))
+  if   [[ -n "$forced"       ]]; then estado="$forced";   color="$C_RED"
+  elif (( STEP_FAIL > 0 ));     then estado="CON FALLOS"; color="$C_RED"
+  elif (( STEP_WARN > 0 ));     then estado="CON AVISOS"; color="$C_YEL"
+  else                               estado="OK";         color="$C_GRN"
+  fi
+  printf '%s          · paso %s%s %s%s%s  %s(%s OK · %s avisos · %s fallos · %ss)%s\n' \
+    "$C_DIM" "$(_step_label)" "$C_RST" "$color" "$estado" "$C_RST" \
+    "$C_DIM" "$STEP_OK" "$STEP_WARN" "$STEP_FAIL" "$d" "$C_RST" >&2
+  STEP_NAME=""
+}
+
+# step <descripción> — abre una tarea nueva y cierra la anterior.
+step() {
+  _step_close
+  STEP_INDEX=$((STEP_INDEX+1)); STEP_NAME="$*"; STEP_START=$SECONDS
+  STEP_OK=0; STEP_WARN=0; STEP_FAIL=0
+  printf '\n%s%s%s  %sPASO%s  %s%-7s %s%s\n' \
+    "$C_DIM" "$(_ts)" "$C_RST" "$C_CYA" "$C_RST" \
+    "$C_BLD" "$(_step_label)" "$*" "$C_RST" >&2
+}
+
+# Número de pasos previstos en la fase; permite mostrar "paso 3/9".
+phase_steps() { PHASE_STEPS="${1:-0}"; }
+
+# --- fases ------------------------------------------------------------------
+# phase_begin <ID> <título> [pasos]
+phase_begin() {
+  PHASE_INDEX=$((PHASE_INDEX+1))
+  PHASE_ID="$1"; PHASE_START=$SECONDS
+  PHASE_STEPS="${3:-0}"; STEP_INDEX=0; STEP_NAME=""
+  PHASE_OK=0; PHASE_WARN=0; PHASE_FAIL=0
+  local prog="" modo="escritura en el clúster destino"
+  (( PHASE_TOTAL > 0 && PHASE_INDEX <= PHASE_TOTAL )) && prog=" ${PHASE_INDEX}/${PHASE_TOTAL}"
+  [[ "${DRY_RUN:-false}" == true ]] && modo="simulación (--dry-run): no se escribe nada"
+  {
+    printf '\n%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+    printf ' %sFASE%s  %s%s%s — %s\n' "$C_CYA$C_BLD" "$prog" "$C_BLD" "$1" "$C_RST" "$2"
+    printf ' %sinicio %s · corrida %s · modo %s%s\n' \
+      "$C_DIM" "$(_now)" "${RUN_ID:-?}" "$modo" "$C_RST"
+    printf '%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+  } >&2
+}
+
+# phase_end [rc] — cierra el paso en curso y resume la fase.
+phase_end() {
+  local rc="${1:-0}" estado color d=$(( SECONDS - PHASE_START ))
+  _step_close
+  if   (( rc != 0 ));        then estado="FALLIDA";    color="$C_RED"
+  elif (( PHASE_FAIL > 0 )); then estado="CON FALLOS"; color="$C_RED"
+  elif (( PHASE_WARN > 0 )); then estado="CON AVISOS"; color="$C_YEL"
+  else                            estado="COMPLETADA"; color="$C_GRN"
+  fi
+  PHASE_SUMMARY+=("${PHASE_ID}|${estado}|${STEP_INDEX}|${PHASE_OK}|${PHASE_WARN}|${PHASE_FAIL}|${d}")
+  [[ -n "${PHASE_FILE:-}" ]] \
+    && printf '%s|%s|%s|%s|%s|%s|%s\n' "$PHASE_ID" "$estado" "$STEP_INDEX" \
+         "$PHASE_OK" "$PHASE_WARN" "$PHASE_FAIL" "$d" >> "$PHASE_FILE"
+  {
+    printf '%s%s%s\n' "$C_DIM" "$(_rule '-')" "$C_RST"
+    printf ' %sFASE %s%s  %s%s%s  ·  %s pasos · %s OK · %s avisos · %s fallos · %s\n' \
+      "$C_BLD" "$PHASE_ID" "$C_RST" "$color" "$estado" "$C_RST" \
+      "$STEP_INDEX" "$PHASE_OK" "$PHASE_WARN" "$PHASE_FAIL" "$(_dur "$d")"
+    printf '%s%s%s\n' "$C_DIM" "$(_rule '-')" "$C_RST"
+  } >&2
+  return 0
+}
+
+# run_phase <ID> <título> <función> — envoltorio de un pase completo.
+# La propia función declara cuántos pasos tiene con phase_steps.
+run_phase() {
+  local id="$1" title="$2" fn="$3" rc=0
+  phase_begin "$id" "$title"
+  "$fn" || rc=$?
+  phase_end "$rc"
+  return "$rc"
+}
+
+# Recuadro informativo que no es una fase: hitos, puntos de control, avisos
+# que el operador debe leer antes de seguir.
+banner() {
+  {
+    printf '\n%s%s%s\n' "$C_YEL" "$(_rule '=')" "$C_RST"
+    printf ' %s%s%s\n' "$C_BLD" "$1" "$C_RST"
+    [[ -n "${2:-}" ]] && printf ' %s%s%s\n' "$C_DIM" "$2" "$C_RST"
+    printf '%s%s%s\n' "$C_YEL" "$(_rule '=')" "$C_RST"
+  } >&2
+}
+
+# Cuadro final con el estado de cada fase de la ejecución.
+run_summary() {
+  local -a filas=()
+  if [[ -n "${PHASE_FILE:-}" && -s "${PHASE_FILE:-/nonexistent}" ]]; then
+    mapfile -t filas < "$PHASE_FILE"
+  else
+    filas=("${PHASE_SUMMARY[@]:-}")
+  fi
+  [[ ${#filas[@]} -eq 0 || -z "${filas[0]}" ]] && return 0
+  local e id st n o w f d
+  {
+    printf '\n%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+    printf ' %sRESUMEN DE LA EJECUCIÓN · corrida %s%s\n' "$C_BLD" "${RUN_ID:-?}" "$C_RST"
+    printf '%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+    printf ' %-12s %-12s %6s %5s %7s %7s %8s\n' FASE ESTADO PASOS OK AVISOS FALLOS TIEMPO
+    for e in "${filas[@]}"; do
+      IFS='|' read -r id st n o w f d <<< "$e"
+      printf ' %-12s %-12s %6s %5s %7s %7s %8s\n' "$id" "$st" "$n" "$o" "$w" "$f" "$(_dur "$d")"
+    done
+    printf '%s%s%s\n' "$C_DIM" "$(_rule '-')" "$C_RST"
+    printf ' Bitácora: %s\n' "${RUN:-.}/migrate.log"
+    printf ' Informes: %s\n' "${REPORTS:-.}"
+    printf '%s%s%s\n\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+  } >&2
+}
 
 # Enmascara credenciales en cualquier texto que vaya al log.
 mask() {
@@ -121,15 +288,31 @@ src_namespaces() { printf '%s\n' $NS_ORDER; }
 #   sanba-core.svc          -> sanba-core-dr.svc        (se reescribe)
 #   sanba-core-legacy-app   -> sanba-core-legacy-app    (NO se toca)
 #   sanba-core-dr           -> sanba-core-dr            (idempotente)
+#
+# Y NUNCA toca la etiqueta de SERVICIO de un FQDN de Kubernetes. En
+# <servicio>.<namespace>.svc el namespace es la etiqueta que precede a .svc; el
+# servicio conserva su nombre porque este script no renombra objetos:
+#
+#   postgresql.sanba-data-persistence.svc -> postgresql.sanba-data-persistence-dr.svc
+#   sanba-core.sanba-core.svc             -> sanba-core.sanba-core-dr.svc
+#                                            ^^^^^^^^^^ el Service se sigue
+#                                            llamando 'sanba-core' en el
+#                                            namespace de contingencia
+#
+# Sin esa exclusión, un Service cuyo nombre coincide con el de su namespace
+# (lo habitual) acababa como sanba-core-dr.sanba-core-dr.svc: un nombre DNS que
+# no resuelve, y el componente se queda sin backend en el drill.
+_NS_SVC_GUARD='(?!\\.[\\w-]+\\.svc)'
+
 ns_jq_gsub() {
-  local s d suf prog='.'
+  local s d suf prog='.' g="$_NS_SVC_GUARD"
   for s in $NS_ORDER; do
     d="$(ns_dst "$s")"
     if [[ "$d" == "$s"* ]]; then
       suf="${d#"$s"}"
-      prog+=" | gsub(\"(?<![\\\\w-])${s}(${suf})?(?![\\\\w-])\"; \"${d}\")"
+      prog+=" | gsub(\"(?<![\\\\w-])${s}(${suf})?(?![\\\\w-])${g}\"; \"${d}\")"
     else
-      prog+=" | gsub(\"(?<![\\\\w-])${s}(?![\\\\w-])\"; \"${d}\")"
+      prog+=" | gsub(\"(?<![\\\\w-])${s}(?![\\\\w-])${g}\"; \"${d}\")"
     fi
   done
   printf '%s' "$prog"

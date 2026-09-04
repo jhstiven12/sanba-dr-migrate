@@ -201,8 +201,11 @@ generate_mirror_script() {
 # sobrescribe el campo image con lo que diga un ImageStream que en contingencia
 # no existe, y el despliegue se queda esperando para siempre.
 tf_rewrite_images() {
-  [[ -s "$RUN/image-map.tsv" ]] || return 0
   step "Fijando las imágenes de contingencia por digest"
+  if [[ ! -s "$RUN/image-map.tsv" ]]; then
+    log "No hay imágenes que fijar (¿el export no trae pods en ejecución?)"
+    return 0
+  fi
 
   local d workload container src dst tag f n=0
   for d in $(src_namespaces | while read -r s; do ns_dst "$s"; done); do
@@ -338,6 +341,7 @@ cmd_mirror() {
   (Ref: Registry 4.18 > Exposing the registry)"
   done
 
+  phase_steps 3
   step "Mirror de imágenes por digest"
   log "  ORIGEN : $reg_src"
   log "  DESTINO: $reg_dst"

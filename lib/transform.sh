@@ -32,22 +32,148 @@ route_map_json() {
   printf '%s' "$out"
 }
 
+# ===========================================================================
+#  Mapa de URLs
+#
+#  El renombrado de namespace arregla las URLs INTERNAS
+#  (postgresql.sanba-data-persistence.svc -> ...-dr.svc), pero no las EXTERNAS:
+#  un ConfigMap que apunta a https://sanba-gui-sanba-gui.apps.prod.example.com
+#  seguiría llamando a producción desde el entorno de contingencia.
+#
+#  Aquí se construye la tabla de sustituciones literales que se aplica al
+#  contenido de ConfigMaps, Secrets, env, args y command, en este orden:
+#
+#    1. url-map.txt          — pares explícitos <origen> <destino> (lo que tú mandes)
+#    2. hosts de las Routes  — host en PROD -> host que tendrá la Route en DR
+#    3. apps-domain          — .apps.<prod> -> .apps.<preprod>, como red de seguridad
+#
+#  Se aplica siempre la coincidencia MÁS LARGA primero, para que un host
+#  concreto gane sobre el dominio genérico que lo contiene.
+# ===========================================================================
+
+# Host que tendrá en contingencia la Route <name> del namespace <s>, con la
+# MISMA regla que aplica el programa jq a .spec.host. Vacío = no deducible.
+route_host_dst() {
+  local name="$1" host="$2" d="$3" srcdom="$4" dstdom="$5" mapped
+  [[ -z "$host" || "$host" == "null" ]] && return 0
+  mapped=$(awk -v h="$host" '$1==h && $2!="" {print $2; exit}' "$RUN/.route-map.txt" 2>/dev/null)
+  if [[ -n "$mapped" ]]; then printf '%s' "$mapped"; return 0; fi
+  if [[ "$host" == *".$srcdom" ]]; then printf '%s' "${name}-${d}.${dstdom}"; return 0; fi
+  return 0
+}
+
+# Genera out/<run>/url-map.tsv:  <origen> <TAB> <destino> <TAB> <procedencia>
+build_url_map() {
+  step "Mapa de URLs de los componentes"
+  local srcdom dstdom s d name host new n_expl=0 n_route=0 n_custom=0
+  srcdom="$(cat "$RUN/domain-src.txt")"; dstdom="$(cat "$RUN/domain-dst.txt")"
+
+  # route-map.txt normalizado (sin comentarios) para route_host_dst
+  : > "$RUN/.route-map.txt"
+  if [[ -r "$ROOT/$ROUTE_MAP_FILE" ]]; then
+    grep -vE '^[[:space:]]*(#|$)' "$ROOT/$ROUTE_MAP_FILE" >> "$RUN/.route-map.txt" || true
+  fi
+
+  local tmp="$RUN/.url-map.raw"; : > "$tmp"
+  : > "$RUN/.url-unmapped.txt"
+
+  # 1. pares explícitos
+  if [[ -r "$ROOT/${URL_MAP_FILE:-url-map.txt}" ]]; then
+    while read -r from to _rest; do
+      [[ -z "${from:-}" || "$from" == \#* || -z "${to:-}" ]] && continue
+      printf '%s\t%s\t%s\n' "$from" "$to" "url-map" >> "$tmp"
+      n_expl=$((n_expl+1))
+    done < "$ROOT/${URL_MAP_FILE:-url-map.txt}"
+  fi
+
+  # 2. hosts de las Routes exportadas de producción
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    [[ -r "$RAW/$s/route.json" ]] || continue
+    while IFS=$'\t' read -r name host; do
+      [[ -z "${name:-}" || -z "${host:-}" || "$host" == "null" ]] && continue
+      new="$(route_host_dst "$name" "$host" "$d" "$srcdom" "$dstdom")"
+      if [[ -n "$new" ]]; then
+        printf '%s\t%s\t%s\n' "$host" "$new" "route" >> "$tmp"
+        n_route=$((n_route+1))
+      else
+        # Host custom sin equivalente: el router asignará uno en DR, así que no
+        # se puede reescribir la referencia. Queda como pendiente explícito.
+        n_custom=$((n_custom+1))
+        printf '%s\n' "$host" >> "$RUN/.url-unmapped.txt"
+        warn "$d/$name: el host '$host' no sigue el patrón del apps-domain y no está en $ROUTE_MAP_FILE"
+        todo "$d/$name: define el destino de '$host' en ${URL_MAP_FILE:-url-map.txt} o en $ROUTE_MAP_FILE; si no, los ConfigMaps/Secrets que lo mencionen seguirán apuntando a PRODUCCIÓN."
+      fi
+    done < <(jq -r '.items[] | [.metadata.name, (.spec.host // "")] | @tsv' < "$RAW/$s/route.json" 2>/dev/null)
+  done
+
+  # 3. apps-domain como red de seguridad para lo que no sea una Route nuestra
+  if [[ "${REWRITE_APPS_DOMAIN:-true}" == true && -n "$srcdom" && "$srcdom" != "$dstdom" ]]; then
+    printf '%s\t%s\t%s\n' "$srcdom" "$dstdom" "apps-domain" >> "$tmp"
+  fi
+
+  # Coincidencia más larga primero; se eliminan duplicados y sustituciones nulas.
+  awk -F'\t' '$1 != "" && $1 != $2 && !seen[$1]++ { print length($1) "\t" $0 }' "$tmp" \
+    | sort -k1,1nr -k2,2 | cut -f2- > "$RUN/url-map.tsv"
+  rm -f "$tmp"
+
+  local total; total=$(wc -l < "$RUN/url-map.tsv")
+  log "  pares explícitos en ${URL_MAP_FILE:-url-map.txt}: $n_expl"
+  log "  hosts de Route deducidos                      : $n_route"
+  [[ "$n_custom" -gt 0 ]] && log "  hosts custom sin equivalente                  : $n_custom"
+  [[ "${REWRITE_APPS_DOMAIN:-true}" == true && "$srcdom" != "$dstdom" ]] \
+    && log "  apps-domain                                   : $srcdom -> $dstdom"
+  awk -F'\t' '{printf "      %-52s -> %-52s (%s)\n", $1, $2, $3}' "$RUN/url-map.tsv" >&2
+  ok "$total sustituciones de URL activas (mapa en $RUN/url-map.tsv)"
+}
+
+# El mapa como array JSON ordenado, listo para --argjson.
+url_map_json() {
+  [[ -s "$RUN/url-map.tsv" ]] || { printf '[]'; return 0; }
+  jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {from: .[0], to: .[1]})' \
+    < "$RUN/url-map.tsv"
+}
+
 # --- programa jq principal --------------------------------------------------
 build_jq_program() {
   local gsub_chain; gsub_chain="$(ns_jq_gsub)"
   cat <<JQEOF
-def rewrite_text: if type == "string" then ${gsub_chain} else . end;
+# Sustitución literal (no regex) de cada par del mapa de URLs. El orden del
+# array ya viene de más largo a más corto, así que un host concreto gana sobre
+# el apps-domain que lo contiene.
+def rewrite_urls:
+  reduce \$urlmap[] as \$m (.; split(\$m.from) | join(\$m.to));
+
+# Primero las URLs externas, después el renombrado de namespace: al revés, el
+# renombrado partiría hosts como sanba-gui-sanba-gui.apps... por la mitad.
+def rewrite_text: if type == "string" then (rewrite_urls | ${gsub_chain}) else . end;
 
 # Reescribe un valor base64 solo si decodifica a texto UTF-8 que round-trippea
 # (así nunca corrompemos claves privadas, keystores ni binarios) y solo si
-# realmente menciona alguno de los namespaces.
+# realmente menciona un namespace o una URL del mapa.
 def rewrite_b64:
   . as \$orig
   | ((try (\$orig | @base64d) catch null)) as \$d
-  | if (\$d != null) and ((\$d | @base64) == \$orig) and (\$d | test(\$nsre))
+  | if (\$d != null) and ((\$d | @base64) == \$orig)
+       and ((\$d | test(\$nsre))
+            or ([\$urlmap[] | .from as \$f | select(\$d | contains(\$f))] | length > 0))
     then (\$d | rewrite_text | @base64)
     else \$orig
     end;
+
+# Un namespaceSelector señala a OTRO namespace por su nombre o por la etiqueta
+# kubernetes.io/metadata.name. Si no se traduce, en contingencia selecciona el
+# namespace de PRODUCCIÓN —que allí no existe— y la NetworkPolicy deja fuera al
+# tráfico legítimo entre los namespaces de la aplicación.
+def fix_nssel:
+  walk(
+    if (type == "object") and (has("namespaceSelector")) and ((.namespaceSelector | type) == "object")
+    then .namespaceSelector |= (
+           (if .matchLabels then .matchLabels |= with_entries(.value |= (\$nsmap[.] // .)) else . end)
+         | (if .matchExpressions then .matchExpressions |= map(
+               if .values then .values |= map(\$nsmap[.] // .) else . end)
+            else . end))
+    else . end);
 
 def sanitize:
   del(.metadata.uid, .metadata.resourceVersion, .metadata.generation,
@@ -64,7 +190,8 @@ def sanitize:
          | with_entries(select(.key | test("^(pv|volume)\\\\.(beta\\\\.)?kubernetes\\\\.io/") | not))
        )
      else . end)
-  | (if (.metadata.annotations // {}) == {} then del(.metadata.annotations) else . end);
+  | (if (.metadata.annotations // {}) == {} then del(.metadata.annotations)
+     else .metadata.annotations |= with_entries(.value |= rewrite_text) end);
 
 def fix_container:
     (if .env      then .env      |= map(if has("value") then .value |= rewrite_text else . end) else . end)
@@ -80,6 +207,9 @@ def perkind:
       del(.spec.clusterIP, .spec.clusterIPs, .spec.ipFamilies, .spec.ipFamilyPolicy,
           .spec.healthCheckNodePort, .spec.loadBalancerIP, .spec.externalIPs)
     | (if .spec.ports then .spec.ports |= map(del(.nodePort)) else . end)
+    # Un Service ExternalName es un alias DNS: si apunta a otro namespace de la
+    # aplicación, en contingencia debe apuntar al -dr correspondiente.
+    | (if (.spec.externalName // "") != "" then .spec.externalName |= rewrite_text else . end)
 
   elif .kind == "PersistentVolumeClaim" then
       del(.spec.volumeName, .spec.dataSource, .spec.dataSourceRef)
@@ -126,6 +256,8 @@ def perkind:
 
   elif (.kind | IN("Deployment","StatefulSet","DaemonSet","DeploymentConfig","Job")) then
       del(.spec.template.metadata.creationTimestamp)
+    | (if .spec.template.metadata.annotations
+       then .spec.template.metadata.annotations |= with_entries(.value |= rewrite_text) else . end)
     | (if .spec.triggers then .spec.triggers |= map(del(.imageChangeParams.lastTriggeredImage)) else . end)
     | (if .spec.template.spec then .spec.template.spec |= fix_podspec else . end)
 
@@ -164,7 +296,8 @@ def keep:
            | select(keep)
            | sanitize
            | .metadata.namespace = \$dstns
-           | perkind ] }
+           | perkind
+           | fix_nssel ] }
 JQEOF
 }
 
@@ -198,8 +331,9 @@ tf_namespaces() {
 tf_namespaced() {
   local s d kind in out prog n
   prog="$(build_jq_program)"
-  local nsmap scmap routemap nsre srcdom dstdom
+  local nsmap scmap routemap nsre srcdom dstdom urlmap
   nsmap="$(ns_map_json)"; scmap="$(sc_map_json)"; routemap="$(route_map_json)"
+  urlmap="$(url_map_json)"
   nsre="$(ns_match_regex)"
   srcdom="$(cat "$RUN/domain-src.txt")"; dstdom="$(cat "$RUN/domain-dst.txt")"
 
@@ -213,6 +347,7 @@ tf_namespaced() {
       out="$CLEAN/$d/$(kind_order "$kind")-$(kind_file "$kind").$MANIFEST_EXT"
       jq --arg dstns "$d" --arg srcns "$s" \
          --argjson nsmap "$nsmap" --argjson scmap "$scmap" --argjson routemap "$routemap" \
+         --argjson urlmap "$urlmap" \
          --arg nsre "$nsre" --arg srcdom "$srcdom" --arg dstdom "$dstdom" \
          --arg tlsmode "$ROUTE_TLS_STRATEGY" --arg custom "$ROUTE_CUSTOM_STRATEGY" \
          --arg keeprb "${MIGRATE_DEFAULT_ROLEBINDINGS:-false}" \
@@ -472,6 +607,291 @@ tf_config_refs() {
   ok "Inventario en $REPORTS/config.txt"
 }
 
+# --- auditoría de URLs ------------------------------------------------------
+# Deja constancia de QUÉ componente apunta ahora a QUÉ URL, y detecta lo que
+# se haya quedado apuntando a producción. Nunca imprime el valor de un Secret:
+# solo el objeto, la clave y el par de URLs sustituido.
+tf_report_urls() {
+  step "Auditoría de URLs en ConfigMaps, Secrets y variables de entorno"
+  local s d kind f urlmap srcdom pats n_rw=0 n_left=0
+  urlmap="$(url_map_json)"
+  srcdom="$(cat "$RUN/domain-src.txt")"
+  # Lo que NO debe quedar en contingencia: el apps-domain de producción y todo
+  # host de PROD que no se haya podido traducir.
+  pats=$( { [[ "${REWRITE_APPS_DOMAIN:-true}" == true ]] && printf '%s\n' "$srcdom"
+            cat "$RUN/.url-unmapped.txt" 2>/dev/null; } \
+          | grep -v '^$' | sort -u | jq -R . | jq -s -c . )
+
+  {
+    printf 'URLs de los componentes en el entorno de contingencia.\n'
+    printf 'Corrida %s · %s\n\n' "$RUN_ID" "$(date -Is)"
+    printf 'Sustituciones aplicadas (out/%s/url-map.tsv):\n' "$RUN_ID"
+    awk -F'\t' '{printf "  %-52s -> %-52s (%s)\n", $1, $2, $3}' "$RUN/url-map.tsv" 2>/dev/null
+    printf '\nDetalle por objeto (de los Secrets solo se muestra la clave):\n'
+    printf '%-26s %-12s %-32s %-24s %s\n' "NAMESPACE(DR)" "KIND" "NOMBRE" "CLAVE" "SUSTITUCIÓN"
+    printf '%s\n' "-----------------------------------------------------------------------------------------------------------------------------"
+  } > "$REPORTS/urls.txt"
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+
+    # ConfigMaps y Secrets: se mira el valor ORIGEN para saber qué se sustituyó.
+    for kind in configmap secret; do
+      f="$RAW/$s/$kind.json"
+      [[ -r "$f" ]] || continue
+      while IFS=$'\t' read -r name key from to; do
+        [[ -z "${name:-}" ]] && continue
+        printf '%-26s %-12s %-32s %-24s %s -> %s\n' "$d" "$kind" "$name" "$key" "$from" "$to" >> "$REPORTS/urls.txt"
+        n_rw=$((n_rw+1))
+      done < <(jq -r --argjson m "$urlmap" --arg kind "$kind" '
+        # Se reproduce la MISMA reducción que aplica la transformación, para
+        # listar solo las sustituciones que de verdad ocurrieron (la más larga
+        # gana; la genérica ya no encuentra nada que sustituir).
+        def aplicadas($v):
+          reduce $m[] as $u ({v: $v, hits: []};
+            if (.v | contains($u.from))
+            then {v: (.v | split($u.from) | join($u.to)), hits: (.hits + [$u])}
+            else . end) | .hits[];
+        .items[]
+        | .metadata.name as $n
+        | ((.data // {}) | to_entries[])
+        | . as $e
+        | (if $kind == "secret"
+           then ((try ($e.value | @base64d) catch "") // "")
+           else ($e.value // "") end) as $plain
+        | aplicadas($plain)
+        | [$n, $e.key, .from, .to] | @tsv' < "$f" 2>/dev/null)
+    done
+
+    # env, args y command de los workloads
+    for kind in deployment deploymentconfig statefulset daemonset cronjob; do
+      f="$RAW/$s/$kind.json"
+      [[ -r "$f" ]] || continue
+      while IFS=$'\t' read -r name key from to; do
+        [[ -z "${name:-}" ]] && continue
+        printf '%-26s %-12s %-32s %-24s %s -> %s\n' "$d" "$kind" "$name" "$key" "$from" "$to" >> "$REPORTS/urls.txt"
+        n_rw=$((n_rw+1))
+      done < <(jq -r --argjson m "$urlmap" '
+        def aplicadas($v):
+          reduce $m[] as $u ({v: $v, hits: []};
+            if (.v | contains($u.from))
+            then {v: (.v | split($u.from) | join($u.to)), hits: (.hits + [$u])}
+            else . end) | .hits[];
+        .items[]
+        | .metadata.name as $n
+        | ((.spec.template.spec // .spec.jobTemplate.spec.template.spec // {})) as $ps
+        | (($ps.containers // []) + ($ps.initContainers // []))[]
+        | . as $c
+        | ( ( ($c.env // [])[] | select(has("value")) | {k: ("env/" + .name), v: (.value // "")} ),
+            ( ($c.args    // [])[] | {k: "args",    v: .} ),
+            ( ($c.command // [])[] | {k: "command", v: .} ) )
+        | . as $x
+        | aplicadas($x.v)
+        | [$n, $x.k, .from, .to] | @tsv' < "$f" 2>/dev/null)
+    done
+
+    # Lo que HAYA QUEDADO apuntando a producción tras la transformación: el
+    # apps-domain de PROD, o un host custom que no se pudo mapear. Es
+    # exactamente el fallo que esta fase debe impedir.
+    while IFS=$'\t' read -r kind name key hit; do
+      [[ -z "${name:-}" ]] && continue
+      err "$d: $kind/$name clave '$key' sigue apuntando a producción ('$hit')"
+      todo "$d: $kind/$name clave '$key' conserva '$hit'. Declara su equivalente de contingencia en ${URL_MAP_FILE:-url-map.txt} y repite 'transform'."
+      printf '%-26s %-12s %-32s %-24s %s\n' "$d" "$kind" "$name" "$key" "SIN RESOLVER -> $hit" >> "$REPORTS/urls.txt"
+      n_left=$((n_left+1))
+    done < <(clean_items "$d" | jq -r --argjson pats "$pats" '
+      .[]
+      | .kind as $k | .metadata.name as $n
+      | ( ( (.data // {}) | to_entries[]
+            | {key: .key,
+               v: (if $k == "Secret" then ((try (.value | @base64d) catch "") // "") else (.value // "") end)} ),
+          ( ((.spec.template.spec // .spec.jobTemplate.spec.template.spec // {})
+             | (.containers // []) + (.initContainers // []))[]
+            | ( ((.env // [])[] | select(has("value")) | {key: ("env/" + .name), v: (.value // "")}),
+                ((.args // [])[] | {key: "args", v: .}),
+                ((.command // [])[] | {key: "command", v: .}) ) ) )
+      | select(.v | type == "string")
+      | . as $e
+      | $pats[] | . as $p
+      | select($e.v | contains($p))
+      | [$k, $n, $e.key, $p] | @tsv')
+  done
+
+  log "  sustituciones de URL aplicadas: $n_rw"
+  if (( n_left > 0 )); then
+    err "$n_left valores siguen apuntando a producción"
+  else
+    ok "Ningún ConfigMap, Secret ni variable de entorno apunta ya a producción"
+  fi
+  ok "Detalle en $REPORTS/urls.txt"
+}
+
+# --- asociación entre namespaces --------------------------------------------
+# Los cuatro namespaces no son independientes: el backend lee la configuración
+# de location-resources, habla con la base de datos y el GUI llama al backend,
+# y todo eso está expresado como nombres DNS <servicio>.<namespace>.svc y como
+# RoleBindings que cruzan de un namespace a otro.
+#
+# Esta comprobación verifica, ANTES de aplicar nada, que en contingencia:
+#   - toda referencia <servicio>.<namespace>.svc apunta a un namespace -dr,
+#   - y que ese Service existe de verdad en ese namespace -dr,
+#   - que ningún RoleBinding ni ClusterRoleBinding sigue concediendo permisos a
+#     una ServiceAccount del namespace de PRODUCCIÓN,
+#   - y que las ServiceAccounts a las que se concede acceso existen.
+tf_cross_refs() {
+  step "Asociación entre namespaces (DNS interno y RBAC cruzado)"
+  local s d ns_re svcs_file="$RUN/.svcs-por-ns.tsv" bad=0 refs=0
+  local out="$REPORTS/cross-namespace.txt"
+
+  # Inventario real de Services y ServiceAccounts que habrá en cada namespace -dr.
+  : > "$svcs_file"
+  local sas_file="$RUN/.sas-por-ns.tsv"; : > "$sas_file"
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    clean_items "$d" service        | jq -r --arg d "$d" '.[] | [$d, .metadata.name] | @tsv' >> "$svcs_file"
+    { clean_items "$d" serviceaccount | jq -r '.[].metadata.name'; echo default; } \
+      | awk -v d="$d" 'NF {print d "\t" $0}' >> "$sas_file"
+  done
+
+  # Alternancia de nombres: primero los -dr, después los de producción, para
+  # poder distinguir una referencia ya traducida de una que se quedó atrás.
+  ns_re=""
+  for s in $(src_namespaces); do ns_re+="${ns_re:+|}$(ns_dst "$s")"; done
+  for s in $(src_namespaces); do ns_re+="|$s"; done
+
+  {
+    printf 'Asociación entre los namespaces de contingencia.\n'
+    printf 'Corrida %s · %s\n\n' "$RUN_ID" "$(date -Is)"
+    printf 'DEPENDENCIAS DNS  (quién llama a qué servicio de qué namespace)\n'
+    printf '%-26s %-34s %-22s %-26s %s\n' "NAMESPACE(DR)" "OBJETO" "CAMPO" "SERVICIO DESTINO" "ESTADO"
+    printf '%s\n' "-------------------------------------------------------------------------------------------------------------------------------------"
+  } > "$out"
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    while IFS=$'\t' read -r kind name campo svc tns; do
+      [[ -z "${svc:-}" ]] && continue
+      refs=$((refs+1))
+      local estado="OK"
+      if [[ "$tns" != *"$DR_SUFFIX" ]]; then
+        estado="SIN TRADUCIR (apunta a PRODUCCIÓN)"
+        err "$d: $kind/$name ($campo) llama a ${svc}.${tns}.svc, que es el namespace de PRODUCCIÓN"
+        todo "$d: $kind/$name ($campo) sigue apuntando a ${svc}.${tns}.svc. Debe apuntar a $(ns_dst "$tns")."
+        bad=$((bad+1))
+      elif ! awk -F'\t' -v n="$tns" -v x="$svc" '$1==n && $2==x {f=1} END{exit !f}' "$svcs_file"; then
+        estado="SERVICE INEXISTENTE en $tns"
+        err "$d: $kind/$name ($campo) llama a ${svc}.${tns}.svc, pero en $tns no se migra ningún Service '$svc'"
+        todo "$d: $kind/$name ($campo) apunta a un Service inexistente (${svc}.${tns}.svc). Services en $tns: $(awk -F'\t' -v n="$tns" '$1==n {printf "%s%s", sep, $2; sep=","}' "$svcs_file")"
+        bad=$((bad+1))
+      fi
+      printf '%-26s %-34s %-22s %-26s %s\n' "$d" "$kind/$name" "$campo" "${svc}.${tns}.svc" "$estado" >> "$out"
+    done < <(clean_items "$d" | jq -r --arg re "([A-Za-z0-9][A-Za-z0-9_-]*)\\.($ns_re)\\.svc" '
+      .[] as $o
+      | ($o | paths(strings)) as $p
+      | ($o | getpath($p)) as $raw
+      | (if ($o.kind == "Secret") and ($p[0] == "data")
+         then ((try ($raw | @base64d) catch "") // "") else $raw end) as $v
+      | select($v | type == "string")
+      | $v | [match($re; "g")][]
+      | [$o.kind, $o.metadata.name, ($p | map(tostring) | join(".")),
+         .captures[0].string, .captures[1].string] | @tsv' | sort -u)
+  done
+
+  # --- RBAC que cruza de un namespace a otro --------------------------------
+  {
+    printf '\nRBAC CRUZADO  (a qué ServiceAccount de otro namespace se le concede acceso)\n'
+    printf '%-26s %-30s %-22s %-30s %s\n' "NAMESPACE(DR)" "BINDING" "SERVICEACCOUNT" "NAMESPACE DE LA SA" "ESTADO"
+    printf '%s\n' "-------------------------------------------------------------------------------------------------------------------------------------"
+  } >> "$out"
+
+  local origen
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    while IFS=$'\t' read -r origen bind sa sans; do
+      [[ -z "${sa:-}" ]] && continue
+      local estado="OK"
+      if [[ -z "$sans" ]]; then
+        sans="$d"                       # sin namespace = el del propio binding
+      fi
+      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+        estado="SIN TRADUCIR (SA de PRODUCCIÓN)"
+        err "$origen $bind concede permisos a la ServiceAccount '$sa' del namespace de PRODUCCIÓN '$sans'"
+        todo "$origen: el binding '$bind' apunta a la SA '$sa' en '$sans'. Debe apuntar a '$(ns_dst "$sans")'."
+        bad=$((bad+1))
+      elif ! awk -F'\t' -v n="$sans" -v x="$sa" '$1==n && $2==x {f=1} END{exit !f}' "$sas_file"; then
+        estado="SERVICEACCOUNT INEXISTENTE"
+        err "$origen $bind concede permisos a '$sa', que no existirá en $sans"
+        todo "$origen: el binding '$bind' apunta a la ServiceAccount '$sa' de '$sans', que no se migra. El permiso quedaría sin efecto."
+        bad=$((bad+1))
+      elif [[ "$sans" != "$d" ]]; then
+        estado="CRUZADO (correcto)"
+        vlog "$d: $bind concede acceso a $sa de $sans"
+      fi
+      printf '%-26s %-30s %-22s %-30s %s\n' "$d" "$bind" "$sa" "$sans" "$estado" >> "$out"
+    done < <(clean_items "$d" rolebinding | jq -r --arg d "$d" '
+      .[] | .metadata.name as $n | ((.subjects // [])[])
+      | select(.kind == "ServiceAccount")
+      | [("RoleBinding " + $d + "/"), $n, .name, (.namespace // "")] | @tsv')
+  done
+
+  # ClusterRoleBindings: viven fuera de los namespaces, pero sus subjects no.
+  local crb
+  if crb="$(clean_file _cluster 80-clusterrolebinding)"; then
+    while IFS=$'\t' read -r bind sa sans; do
+      [[ -z "${sa:-}" ]] && continue
+      local estado="CRUZADO (correcto)"
+      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+        estado="SIN TRADUCIR (SA de PRODUCCIÓN)"
+        err "ClusterRoleBinding/$bind concede permisos de clúster a la SA '$sa' del namespace de PRODUCCIÓN '$sans'"
+        todo "ClusterRoleBinding/$bind: la SA '$sa' sigue en '$sans'. Debe ser '$(ns_dst "$sans")'."
+        bad=$((bad+1))
+      elif ! awk -F'\t' -v n="$sans" -v x="$sa" '$1==n && $2==x {f=1} END{exit !f}' "$sas_file"; then
+        estado="SERVICEACCOUNT INEXISTENTE"
+        err "ClusterRoleBinding/$bind concede permisos a '$sa', que no existirá en $sans"
+        bad=$((bad+1))
+      fi
+      printf '%-26s %-30s %-22s %-30s %s\n' "(cluster)" "$bind" "$sa" "$sans" "$estado" >> "$out"
+    done < <(read_manifest "$crb" | jq -r '
+      .items[] | .metadata.name as $n | ((.subjects // [])[])
+      | select(.kind == "ServiceAccount") | [$n, .name, (.namespace // "")] | @tsv')
+  fi
+
+  # --- selectores de namespace en NetworkPolicies ---------------------------
+  {
+    printf '\nSELECTORES DE NAMESPACE  (NetworkPolicy)\n'
+    printf '%-26s %-34s %-40s %s\n' "NAMESPACE(DR)" "NETWORKPOLICY" "SELECCIONA" "ESTADO"
+    printf '%s\n' "-------------------------------------------------------------------------------------------------------------------------------------"
+  } >> "$out"
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    while IFS=$'\t' read -r name valor; do
+      [[ -z "${valor:-}" ]] && continue
+      local estado="OK"
+      if [[ "$valor" != *"$DR_SUFFIX" ]]; then
+        estado="SIN TRADUCIR (selecciona PRODUCCIÓN)"
+        err "$d: NetworkPolicy/$name selecciona el namespace '$valor', que en contingencia no existe"
+        todo "$d: NetworkPolicy/$name selecciona '$valor'. En contingencia debe seleccionar '$(ns_dst "$valor")' o el tráfico quedará bloqueado."
+        bad=$((bad+1))
+      fi
+      printf '%-26s %-34s %-40s %s\n' "$d" "$name" "$valor" "$estado" >> "$out"
+    done < <(clean_items "$d" networkpolicy | jq -r --arg re "^($ns_re)\$" '
+      .[] | .metadata.name as $n
+      | [ .. | objects | select(has("namespaceSelector")) | .namespaceSelector
+          | ((.matchLabels // {}) | to_entries[] | .value),
+            ((.matchExpressions // [])[] | (.values // [])[]) ]
+      | .[] | select(test($re)) | [$n, .] | @tsv' | sort -u)
+  done
+
+  log "  referencias DNS entre namespaces analizadas: $refs"
+  if (( bad > 0 )); then
+    err "$bad asociaciones entre namespaces son incorrectas — ver $out"
+  else
+    ok "Todas las dependencias apuntan a los namespaces de contingencia y resuelven"
+  fi
+  ok "Detalle en $out"
+}
+
 # --- RoleBindings autogenerados por OpenShift -------------------------------
 tf_report_default_rolebindings() {
   [[ "${MIGRATE_DEFAULT_ROLEBINDINGS:-false}" == true ]] && return 0
@@ -573,6 +993,12 @@ cmd_transform() {
   clean_cache_reset
   : > "$REPORTS/manual-todo.txt"
 
+  # 12 pasos fijos + uno por cada namespace transformado
+  phase_steps $(( $(src_namespaces | wc -l) + 12 ))
+
+  # El mapa de URLs se construye ANTES de transformar: tf_namespaced lo aplica
+  # al contenido de ConfigMaps, Secrets, env, args y command.
+  build_url_map
   tf_namespaces
   tf_namespaced
   tf_report_default_rolebindings
@@ -580,6 +1006,8 @@ cmd_transform() {
   tf_serviceaccounts
   tf_config_refs
   tf_report_rewrites
+  tf_report_urls
+  tf_cross_refs
   tf_routes
   cmd_images
   tf_rewrite_images
@@ -588,6 +1016,8 @@ cmd_transform() {
   step "Transform terminado"
   log "Manifiestos listos en: $CLEAN"
   log "Reportes en:           $REPORTS"
+  log "Mapa de URLs:          $REPORTS/urls.txt"
+  log "Asociación de NS:      $REPORTS/cross-namespace.txt"
   if [[ -s "$REPORTS/manual-todo.txt" ]]; then
     warn "Hay $(wc -l < "$REPORTS/manual-todo.txt") puntos pendientes en $REPORTS/manual-todo.txt"
   fi

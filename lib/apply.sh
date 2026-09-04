@@ -158,6 +158,8 @@ apply_namespace() {
 
 cmd_apply() {
   require_cmd oc jq
+  # namespaces + prerrequisitos + cierre
+  phase_steps $(( $(src_namespaces | wc -l) + 2 ))
   [[ -d "$CLEAN" ]] || die "No hay manifiestos limpios en $CLEAN. Ejecuta primero: $0 transform"
 
   # Guardas: nunca aplicar sobre el clúster origen.
@@ -182,7 +184,7 @@ cmd_apply() {
     # desplegar. Aquí se avisa y se sigue: es preferible un drill completo con
     # la base de datos pendiente que medio entorno sin crear.
     if [[ "$s" == "$DB_NS" && "$DB_MIGRATE" == true && "${SKIP_DB:-false}" != true && -z "${ONLY_NS:-}" ]]; then
-      if ( cmd_db_migrate ); then
+      if ( run_phase DB-MIGRATE "Carga de datos PostgreSQL de PROD a contingencia" cmd_db_migrate ); then
         DB_STEP_OK=true
       else
         DB_STEP_OK=false

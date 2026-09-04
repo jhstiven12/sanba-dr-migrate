@@ -290,6 +290,7 @@ discover_parameters() {
 }
 
 cmd_preflight() {
+  phase_steps 10
   check_dependencies
   check_oc_version
   check_logins

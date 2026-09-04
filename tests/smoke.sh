@@ -16,19 +16,19 @@ ln -sf mock-oc tests/oc 2>/dev/null
 mkdir -p "$HOME/.kube"; touch "$HOME/.kube/config-prod" "$HOME/.kube/config-preprod"
 
 head_ "Sintaxis"
-for f in sanba-dr-migrate.sh lib/*.sh; do
+for f in sanba-dr.sh sanba-dr-migrate.sh lib/*.sh; do
   bash -n "$f" && ok "$f" || bad "$f"
 done
 
 head_ "Funciones invocadas pero no definidas"
-defined=$( { grep -hoP '^\K[a-z_]+(?=\(\) \{)' lib/*.sh sanba-dr-migrate.sh; \
+defined=$( { grep -hoP '^\K[a-z_]+(?=\(\) \{)' lib/*.sh sanba-dr-migrate.sh sanba-dr.sh; \
              printf '%s\n' log vlog step ok warn err die mask report todo; } | sort -u )
 # Dos formas de invocar: al principio de una orden, y dentro de $( ). Se exige
 # un espacio detrás del nombre para no confundir una asignación (db_pod=...)
 # con una llamada.
-prefijos='db_|cmd_|tf_|apply_|check_|v_|export_|clean_|read_manifest|to_manifest|discover_|wait_|reconcile_'
-invocadas=$( { grep -hoE "^[[:space:]]*($prefijos)[a-z_]*[[:space:]]"  lib/*.sh sanba-dr-migrate.sh
-               grep -hoE "\\\$\\(($prefijos)[a-z_]*[[:space:]]"       lib/*.sh sanba-dr-migrate.sh | sed 's/^\$(//'
+prefijos='db_|cmd_|tf_|apply_|check_|v_|export_|clean_|read_manifest|to_manifest|discover_|wait_|reconcile_|build_|url_map|route_host_|login_cluster|session_info|menu_|flags_actuales|phase_|run_phase|run_summary|banner|step_'
+invocadas=$( { grep -hoE "^[[:space:]]*($prefijos)[a-z_]*[[:space:]]"  lib/*.sh sanba-dr-migrate.sh sanba-dr.sh
+               grep -hoE "\\\$\\(($prefijos)[a-z_]*[[:space:]]"       lib/*.sh sanba-dr-migrate.sh sanba-dr.sh | sed 's/^\$(//'
              } | tr -d ' ' | sort -u )
 missing=0
 for fn in $invocadas; do
@@ -54,6 +54,84 @@ rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
   && ok "transform genera JSON" || bad "transform sin yq"
 ./sanba-dr-migrate.sh apply --run SMOKE --dry-run >/dev/null 2>&1 && ok "apply --dry-run (JSON)" || bad "apply --dry-run (JSON)"
 rm -f tests/yq
+
+head_ "URLs nuevas en ConfigMaps, Secrets y variables de entorno"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+URL_MAP_FILE=tests/url-map-test.txt ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+
+cm=$(yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml | jq -r '.items[] | select(.metadata.name=="sanba-core-config") | .data')
+[[ "$(jq -r .GUI_PUBLIC_URL <<< "$cm")" == "https://sanba-gui-sanba-gui-dr.apps.preprod.example.com/app" ]] \
+  && ok "el host de la Route se reescribe al de contingencia" \
+  || bad "GUI_PUBLIC_URL: $(jq -r .GUI_PUBLIC_URL <<< "$cm")"
+[[ "$(jq -r .PAGOS_URL <<< "$cm")" == "https://api-pagos-qa.corp.example.com/v1" ]] \
+  && ok "url-map.txt sustituye el endpoint externo" \
+  || bad "PAGOS_URL: $(jq -r .PAGOS_URL <<< "$cm")"
+grep -q 'sanba-data-persistence-dr.svc' <<< "$cm" \
+  && ok "las URLs internas siguen usando el renombrado de namespace" \
+  || bad "se perdió el renombrado de namespace en la URL interna"
+
+sec=$(yq -o=json '.' out/SMOKE/clean/sanba-core-dr/20-secret.yaml | jq -r '.items[] | select(.metadata.name=="sanba-core-db") | .data')
+[[ "$(jq -r .CALLBACK_URL <<< "$sec" | base64 -d)" == "https://sanba-gui-sanba-gui-dr.apps.preprod.example.com/callback" ]] \
+  && ok "la URL dentro del Secret se reescribe" \
+  || bad "CALLBACK_URL: $(jq -r .CALLBACK_URL <<< "$sec" | base64 -d)"
+[[ "$(jq -r '.["keystore.p12"]' <<< "$sec")" == "AAEC//7ItAABAv/+yLQAAQL//si0AAEC//7ItA==" ]] \
+  && ok "el binario del Secret queda intacto" || bad "se corrompió keystore.p12"
+
+grep -q 'SIN RESOLVER' out/SMOKE/reports/urls.txt \
+  && ok "el host custom sin mapear se marca como pendiente" || bad "no se detectó la URL sin resolver"
+grep -q "env/PORTAL_URL" out/SMOKE/reports/manual-todo.txt \
+  && ok "la URL sin resolver llega a manual-todo.txt" || bad "manual-todo.txt no recoge la URL sin resolver"
+head -1 out/SMOKE/url-map.tsv | grep -q 'sanba-gui-sanba-gui.apps.prod.example.com' \
+  && ok "el mapa aplica primero la coincidencia más larga" || bad "el mapa de URLs está mal ordenado"
+
+head_ "Asociación entre namespaces"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+URL_MAP_FILE=tests/url-map-test.txt ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+
+# El Service conserva su nombre; solo cambia la etiqueta de namespace del FQDN.
+cm=$(yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml | jq -r '.items[]|select(.metadata.name=="sanba-core-config")|.data')
+grep -q 'sanba-gui.sanba-gui-dr.svc' <<< "$cm" \
+  && ok "el FQDN interno conserva el nombre del Service" \
+  || bad "FQDN mal reescrito: $(jq -r '.["application.yaml"]' <<< "$cm" | grep gui)"
+grep -q 'sanba-gui-dr.sanba-gui-dr.svc' <<< "$cm" \
+  && bad "se reescribió también la etiqueta de servicio" || ok "no se toca la etiqueta de servicio"
+api=$(yq -o=json '.' out/SMOKE/clean/sanba-gui-dr/50-deployment.yaml | jq -r '.items[].spec.template.spec.containers[0].env[0].value')
+[[ "$api" == "http://sanba-core.sanba-core-dr.svc:8080" ]] \
+  && ok "el GUI apunta al backend de contingencia" || bad "env API: $api"
+
+# ExternalName y anotaciones
+svc=$(yq -o=json '.' out/SMOKE/clean/location-resources-dr/40-service.yaml)
+[[ "$(jq -r '.items[]|select(.metadata.name=="core-alias")|.spec.externalName' <<< "$svc")" \
+   == "sanba-core.sanba-core-dr.svc.cluster.local" ]] \
+  && ok "el Service ExternalName apunta al namespace -dr" || bad "externalName sin traducir"
+jq -r '.items[]|select(.metadata.name=="core-alias")|.metadata.annotations.doc' <<< "$svc" | grep -q 'sanba-core-dr.svc' \
+  && ok "las anotaciones con URLs se reescriben" || bad "anotación sin reescribir"
+
+# NetworkPolicy: matchLabels y matchExpressions
+np=$(yq -o=json '.' out/SMOKE/clean/location-resources-dr/70-networkpolicy.yaml)
+[[ "$(jq -r '[.. | objects | select(has("namespaceSelector")) | .namespaceSelector
+              | ((.matchLabels // {}) | to_entries[] | .value), ((.matchExpressions // [])[] | (.values // [])[])]
+             | map(select(endswith("-dr") | not)) | length' <<< "$np")" == "0" ]] \
+  && ok "los namespaceSelector seleccionan los namespaces de contingencia" \
+  || bad "queda un selector apuntando a producción: $(jq -c '[.. |objects|select(has("namespaceSelector")).namespaceSelector]' <<< "$np")"
+
+# Informe de asociación
+grep -q 'core-can-read .* sanba-core-sa .* sanba-core-dr .* CRUZADO (correcto)' out/SMOKE/reports/cross-namespace.txt \
+  && ok "el RBAC cruzado queda registrado como correcto" || bad "el informe no refleja el RBAC cruzado"
+grep -q 'SIN TRADUCIR' out/SMOKE/reports/cross-namespace.txt \
+  && bad "queda una referencia sin traducir" || ok "ninguna referencia apunta a producción"
+grep -q 'huerfano .* SERVICE INEXISTENTE' out/SMOKE/reports/cross-namespace.txt \
+  && ok "detecta la referencia a un Service que no existe" || bad "no detectó el Service inexistente"
+
+# Validación en caliente (contra el oc simulado)
+salida=$(./sanba-dr-migrate.sh validate --run SMOKE 2>&1)
+grep -q 'config.location-resources-dr.svc resuelve y tiene endpoints' <<< "$salida" \
+  && ok "validate comprueba que el backend alcanza la config de location-resources-dr" \
+  || bad "validate no verificó la dependencia con location-resources-dr"
+grep -q 'rolebinding/core-can-read concede acceso a sanba-core-sa de sanba-core-dr' <<< "$salida" \
+  && ok "validate comprueba el RBAC cruzado en el clúster" || bad "validate no verificó el RBAC cruzado"
+grep -q 'networkpolicy/allow-app selecciona correctamente' <<< "$salida" \
+  && ok "validate comprueba los selectores de NetworkPolicy" || bad "validate no verificó las NetworkPolicies"
 
 head_ "Fijado de imágenes por digest"
 rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null

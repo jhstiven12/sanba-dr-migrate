@@ -202,7 +202,8 @@ export_registry_routes() {
 
 cmd_export() {
   require_cmd oc jq
-  step "Exportando desde el clúster ORIGEN (solo lectura)"
+  phase_steps 6
+  step "Extrayendo recursos de los namespaces de producción"
   mkdir -p "$RAW/_cluster"
   load_available_kinds
 

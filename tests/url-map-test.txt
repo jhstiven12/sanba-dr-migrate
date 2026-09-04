@@ -1,0 +1,2 @@
+# Pares explícitos usados por tests/smoke.sh
+https://api-pagos.corp.example.com    https://api-pagos-qa.corp.example.com

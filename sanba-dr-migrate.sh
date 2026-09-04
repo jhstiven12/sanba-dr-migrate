@@ -32,10 +32,13 @@ usage() {
   cat <<'USAGE'
 sanba-dr-migrate.sh — migración DR de SANBA (OpenShift 4.18)
 
+Es el motor. Para operar el drill con menú y autenticación guiada:  ./sanba-dr.sh
+
 SUBCOMANDOS
   preflight    Valida versiones de oc, sesiones, permisos, namespaces y StorageClasses.
   export       Extrae los recursos del clúster ORIGEN a out/<run>/raw  (solo lectura).
-  transform    Sanea, renombra namespaces y reescribe Routes -> out/<run>/clean.
+  transform    Sanea, renombra namespaces, reescribe Routes y sustituye las URLs
+               de ConfigMaps, Secrets, env, args y command -> out/<run>/clean.
   apply        Aplica los manifiestos en el clúster DESTINO en orden de dependencias.
                Encadena db-migrate justo después de levantar la base de datos.
   mirror       Copia con skopeo, POR DIGEST, las imágenes del registry interno de
@@ -47,6 +50,11 @@ SUBCOMANDOS
                contingencia y sus ClusterRoleBindings en PRE-PRODUCCIÓN, para
                poder repetir el drill. Nunca toca producción. Exige --confirm.
   report       Muestra dónde están los informes de una corrida.
+
+INFORMES CLAVE
+  reports/manual-todo.txt   lo que hay que resolver a mano
+  reports/urls.txt          qué URL tiene cada componente y cuáles quedan sin resolver
+  reports/validation.txt    resultado de la validación end-to-end
 
 OPCIONES
   --run <ID>        Reutiliza una corrida anterior (por defecto: la última).
@@ -109,8 +117,19 @@ REPORTS="$RUN/reports"
 mkdir -p "$RUN" "$RAW" "$CLEAN" "$REPORTS"
 touch "$REPORTS/manual-todo.txt"
 
-# Todo el log (que va a stderr) queda también en el archivo de la corrida.
-exec 2> >(tee -a "$RUN/migrate.log" >&2)
+# Resumen de fases: en fichero, porque 'apply' encadena 'db-migrate' dentro de
+# una subshell y un array de bash no sobreviviría a eso.
+PHASE_FILE="$RUN/.phases"
+: > "$PHASE_FILE"
+
+# Si stderr es un terminal se decide AQUÍ, antes de redirigirlo: a partir de la
+# línea siguiente stderr es una tubería y [[ -t 2 ]] siempre diría que no.
+if [[ -t 2 ]]; then SANBA_TTY=true; else SANBA_TTY=false; fi
+export SANBA_TTY
+
+# Todo el log (que va a stderr) queda también en el archivo de la corrida, sin
+# secuencias de color: migrate.log se lee y se grepea en limpio.
+exec 2> >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$RUN/migrate.log") >&2)
 
 # --- librerías --------------------------------------------------------------
 # shellcheck source=lib/common.sh
@@ -132,13 +151,15 @@ trap 'rc=$?; if [[ $rc -ne 0 && -z "${_SANBA_DIED:-}" ]]; then
 # =============================================================================
 cmd_rollback() {
   require_cmd oc jq
-  step "Rollback del entorno de DR"
+  phase_steps 3
+  step "Comprobando que ORIGEN y DESTINO son clústeres distintos"
 
   local src_api dst_api
   src_api=$(oc_src whoami --show-server 2>/dev/null) || die "Sesión de ORIGEN inválida"
   dst_api=$(oc_dst whoami --show-server 2>/dev/null) || die "Sesión de DESTINO inválida"
   [[ "$src_api" != "$dst_api" ]] || die "ORIGEN y DESTINO son el mismo clúster. Abortando."
 
+  step "Inventario de namespaces de contingencia a borrar"
   local s d targets=()
   for s in $(src_namespaces); do
     d="$(ns_dst "$s")"
@@ -162,6 +183,7 @@ cmd_rollback() {
     die "Añade --confirm para ejecutar el borrado."
   fi
 
+  step "Borrado de namespaces y ClusterRoleBindings de contingencia"
   for d in "${targets[@]}"; do
     log "  borrando namespace $d"
     oc_dstw delete namespace "$d" --wait=false >/dev/null || warn "No se pudo borrar $d"
@@ -183,11 +205,13 @@ cmd_rollback() {
 }
 
 cmd_report() {
+  phase_steps 1
   step "Informes de la corrida $RUN_ID"
   local f
-  for f in validation routes images serviceaccounts config ns-rewrites manual-todo; do
+  for f in validation routes urls images serviceaccounts config ns-rewrites manual-todo; do
     [[ -r "$REPORTS/$f.txt" ]] && log "  $REPORTS/$f.txt"
   done
+  [[ -r "$RUN/url-map.tsv" ]] && log "  $RUN/url-map.tsv"
   [[ -r "$RUN/mirror-commands.sh" ]] && log "  $RUN/mirror-commands.sh"
   [[ -r "$RUN/db/rowcounts.diff" ]] && log "  $RUN/db/rowcounts.diff"
   [[ -r "$RUN/migrate.log" ]] && log "  $RUN/migrate.log"
@@ -195,12 +219,16 @@ cmd_report() {
 }
 
 cmd_all() {
-  cmd_preflight
-  cmd_export
-  cmd_transform
+  PHASE_TOTAL=5
+  run_phase PREFLIGHT "$T_PREFLIGHT" cmd_preflight
+  run_phase EXPORT    "$T_EXPORT"    cmd_export
+  run_phase TRANSFORM "$T_TRANSFORM" cmd_transform
 
+  # Punto de control: es la última oportunidad de parar antes de escribir en
+  # pre-producción. No es una fase, es una puerta.
   if [[ -s "$REPORTS/manual-todo.txt" ]]; then
-    step "Pendientes detectados antes de aplicar"
+    banner "PUNTO DE CONTROL — $(wc -l < "$REPORTS/manual-todo.txt") pendientes antes de tocar pre-producción" \
+           "$REPORTS/manual-todo.txt"
     cat "$REPORTS/manual-todo.txt" >&2
     if [[ "$FORCE" != true ]]; then
       die "Resuelve los puntos anteriores (o repite con --force para continuar de todos modos)."
@@ -208,26 +236,39 @@ cmd_all() {
     warn "Continuando pese a los pendientes por --force"
   fi
 
-  cmd_apply
-  cmd_validate || return $?
+  run_phase APPLY    "$T_APPLY"    cmd_apply
+  run_phase VALIDATE "$T_VALIDATE" cmd_validate || return $?
 }
 
 # =============================================================================
 # 'validate' y 'all' devuelven != 0 cuando alguna comprobación falla: eso no es
 # un error del script, así que se propaga el código sin disparar el trap de ERR.
+# Título de cada fase, compartido entre 'all' y la ejecución suelta.
+T_PREFLIGHT="Validación previa: host, sesiones, permisos y almacenamiento"
+T_EXPORT="Extracción del clúster ORIGEN (solo lectura)"
+T_TRANSFORM="Saneo, renombrado de namespaces y reescritura de URLs"
+T_APPLY="Despliegue en el clúster de contingencia"
+T_MIRROR="Mirror de imágenes por digest"
+T_DBMIGRATE="Carga de datos PostgreSQL de PROD a contingencia"
+T_VALIDATE="Validación end-to-end del entorno de contingencia"
+T_ROLLBACK="Borrado del entorno de contingencia (solo pre-producción)"
+T_REPORT="Informes de la corrida"
+
 EXIT_RC=0
 case "$CMD" in
-  preflight)  cmd_preflight ;;
-  export)     cmd_export ;;
-  transform)  cmd_transform ;;
-  apply)      cmd_apply ;;
-  mirror)     cmd_mirror    || EXIT_RC=$? ;;
-  db-migrate) cmd_db_migrate ;;
-  validate)   cmd_validate  || EXIT_RC=$? ;;
-  all)        cmd_all       || EXIT_RC=$? ;;
-  rollback)   cmd_rollback ;;
-  report)     cmd_report ;;
-  -h|--help|help) usage ;;
+  preflight)  PHASE_TOTAL=1; run_phase PREFLIGHT  "$T_PREFLIGHT"  cmd_preflight ;;
+  export)     PHASE_TOTAL=1; run_phase EXPORT     "$T_EXPORT"     cmd_export ;;
+  transform)  PHASE_TOTAL=1; run_phase TRANSFORM  "$T_TRANSFORM"  cmd_transform ;;
+  apply)      PHASE_TOTAL=1; run_phase APPLY      "$T_APPLY"      cmd_apply ;;
+  mirror)     PHASE_TOTAL=1; run_phase MIRROR     "$T_MIRROR"     cmd_mirror     || EXIT_RC=$? ;;
+  db-migrate) PHASE_TOTAL=1; run_phase DB-MIGRATE "$T_DBMIGRATE"  cmd_db_migrate ;;
+  validate)   PHASE_TOTAL=1; run_phase VALIDATE   "$T_VALIDATE"   cmd_validate   || EXIT_RC=$? ;;
+  all)        cmd_all || EXIT_RC=$? ;;
+  rollback)   PHASE_TOTAL=1; run_phase ROLLBACK   "$T_ROLLBACK"   cmd_rollback ;;
+  report)     PHASE_TOTAL=1; run_phase REPORT     "$T_REPORT"     cmd_report ;;
+  -h|--help|help) usage; exit 0 ;;
   *) echo "Subcomando desconocido: $CMD" >&2; usage; exit 1 ;;
 esac
+
+run_summary
 exit "$EXIT_RC"
