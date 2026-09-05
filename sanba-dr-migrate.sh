@@ -24,6 +24,8 @@ VERBOSE=false
 FORCE=false
 CONFIRM=false
 SKIP_DB=false
+WITH_DB=false
+RELOAD_DB=false
 ONLY_NS=""
 RUN_ID=""
 CMD=""
@@ -40,12 +42,17 @@ SUBCOMANDOS
   transform    Sanea, renombra namespaces, reescribe Routes y sustituye las URLs
                de ConfigMaps, Secrets, env, args y command -> out/<run>/clean.
   apply        Aplica los manifiestos en el clúster DESTINO en orden de dependencias.
-               Encadena db-migrate justo después de levantar la base de datos.
+               NO carga datos: la base de datos es una fase aparte (db-migrate).
   mirror       Copia con skopeo, POR DIGEST, las imágenes del registry interno de
                producción al de pre-producción, y verifica que el digest coincide.
   db-migrate   pg_dump en PROD -> pg_restore en DR, con comparación de filas.
+               Si la base de datos de contingencia ya tiene datos, pregunta si
+               recargarla (o pásale --reload-db para no preguntar).
+  restart      Reinicia los workloads que arrancaron antes de cargar los datos.
+               No toca el namespace de la base de datos.
   validate     Comprueba rollouts, pods, PVCs, URLs, BD, ServiceAccounts y config.
-  all          preflight -> export -> transform -> apply -> validate.
+  all          Flujo completo, en este orden:
+               preflight -> export -> transform -> apply -> db-migrate -> restart -> validate
   rollback     ÚNICO subcomando que borra algo. Elimina los namespaces de
                contingencia y sus ClusterRoleBindings en PRE-PRODUCCIÓN, para
                poder repetir el drill. Nunca toca producción. Exige --confirm.
@@ -61,18 +68,26 @@ OPCIONES
   --only <ns>       Limita la operación a un namespace ORIGEN.
   --dry-run         No escribe en el clúster destino; solo muestra lo que haría.
   --force           Permite reutilizar namespaces -dr ya existentes.
-  --no-db           No encadena la migración de datos durante 'apply'.
+  --no-db           Omite las fases de datos (db-migrate y restart) en 'all'.
+  --with-db         'apply' encadena la carga de datos, como antes de separarlas.
+  --reload-db       Autoriza a RECARGAR la base de datos de contingencia aunque
+                    ya tenga datos: pg_restore --clean --if-exists. Solo afecta a
+                    pre-producción; en producción nunca se escribe.
   --confirm         Requerido por 'rollback'.
   -v, --verbose     Más detalle.
   -h, --help        Esta ayuda.
 
-EJEMPLO
+EJEMPLO  (el orden importa)
   export KUBECONFIG_SRC=~/.kube/config-prod
   export KUBECONFIG_DST=~/.kube/config-preprod
   ./sanba-dr-migrate.sh preflight
-  ./sanba-dr-migrate.sh export && ./sanba-dr-migrate.sh transform
+  ./sanba-dr-migrate.sh export
+  ./sanba-dr-migrate.sh transform
   # revisar out/<run>/reports/ antes de continuar
-  ./sanba-dr-migrate.sh apply
+  ./sanba-dr-migrate.sh mirror       # si hay imágenes del registry interno
+  ./sanba-dr-migrate.sh apply        # despliega, sin datos
+  ./sanba-dr-migrate.sh db-migrate   # carga los datos
+  ./sanba-dr-migrate.sh restart      # reinicia lo que arrancó contra la base vacía
   ./sanba-dr-migrate.sh validate
 USAGE
 }
@@ -87,6 +102,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run)  DRY_RUN=true; shift ;;
     --force)    FORCE=true; shift ;;
     --no-db)    SKIP_DB=true; shift ;;
+    --with-db)  WITH_DB=true; shift ;;
+    --reload-db) RELOAD_DB=true; shift ;;
     --confirm)  CONFIRM=true; shift ;;
     -v|--verbose) VERBOSE=true; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -99,8 +116,16 @@ done
 # shellcheck source=/dev/null
 source "$ROOT/sanba-dr.env"
 
+# --- ayuda: nunca depende de que exista una corrida -------------------------
+case "$CMD" in -h|--help|help) usage; exit 0 ;; esac
+
 # --- directorio de la corrida ----------------------------------------------
-latest_run() { ls -1 "$ROOT/out" 2>/dev/null | grep -E '^[0-9]{8}-[0-9]{6}$' | sort | tail -1; }
+# El 'grep' no encuentra nada cuando out/ está vacío y, con 'pipefail', ese 1
+# hacía fallar la asignación y morir al script sin imprimir una sola línea: el
+# trap de ERR todavía no está instalado a esta altura. Por eso el '|| true'.
+latest_run() {
+  ls -1 "$ROOT/out" 2>/dev/null | grep -E '^[0-9]{8}-[0-9]{6}$' | sort | tail -1 || true
+}
 
 case "$CMD" in
   preflight|export|all)
@@ -219,7 +244,8 @@ cmd_report() {
 }
 
 cmd_all() {
-  PHASE_TOTAL=5
+  PHASE_TOTAL=7
+  [[ "$DB_MIGRATE" != true || "${SKIP_DB:-false}" == true ]] && PHASE_TOTAL=5
   run_phase PREFLIGHT "$T_PREFLIGHT" cmd_preflight
   run_phase EXPORT    "$T_EXPORT"    cmd_export
   run_phase TRANSFORM "$T_TRANSFORM" cmd_transform
@@ -236,7 +262,18 @@ cmd_all() {
     warn "Continuando pese a los pendientes por --force"
   fi
 
-  run_phase APPLY    "$T_APPLY"    cmd_apply
+  run_phase APPLY "$T_APPLY" cmd_apply
+
+  # La base de datos va DESPUÉS del despliegue y ANTES de la validación, con el
+  # reinicio en medio: los workloads arrancaron contra una base vacía.
+  if [[ "$DB_MIGRATE" == true && "${SKIP_DB:-false}" != true ]]; then
+    run_phase DB-MIGRATE "$T_DBMIGRATE" cmd_db_migrate
+    run_phase RESTART    "$T_RESTART"   cmd_restart
+  else
+    banner "FASES DE DATOS OMITIDAS" \
+           "DB_MIGRATE=$DB_MIGRATE, --no-db=${SKIP_DB:-false}: la base de datos de contingencia queda como esté."
+  fi
+
   run_phase VALIDATE "$T_VALIDATE" cmd_validate || return $?
 }
 
@@ -250,6 +287,7 @@ T_TRANSFORM="Saneo, renombrado de namespaces y reescritura de URLs"
 T_APPLY="Despliegue en el clúster de contingencia"
 T_MIRROR="Mirror de imágenes por digest"
 T_DBMIGRATE="Carga de datos PostgreSQL de PROD a contingencia"
+T_RESTART="Reinicio de los workloads que arrancaron sin datos"
 T_VALIDATE="Validación end-to-end del entorno de contingencia"
 T_ROLLBACK="Borrado del entorno de contingencia (solo pre-producción)"
 T_REPORT="Informes de la corrida"
@@ -262,11 +300,11 @@ case "$CMD" in
   apply)      PHASE_TOTAL=1; run_phase APPLY      "$T_APPLY"      cmd_apply ;;
   mirror)     PHASE_TOTAL=1; run_phase MIRROR     "$T_MIRROR"     cmd_mirror     || EXIT_RC=$? ;;
   db-migrate) PHASE_TOTAL=1; run_phase DB-MIGRATE "$T_DBMIGRATE"  cmd_db_migrate ;;
+  restart)    PHASE_TOTAL=1; run_phase RESTART    "$T_RESTART"    cmd_restart ;;
   validate)   PHASE_TOTAL=1; run_phase VALIDATE   "$T_VALIDATE"   cmd_validate   || EXIT_RC=$? ;;
   all)        cmd_all || EXIT_RC=$? ;;
   rollback)   PHASE_TOTAL=1; run_phase ROLLBACK   "$T_ROLLBACK"   cmd_rollback ;;
   report)     PHASE_TOTAL=1; run_phase REPORT     "$T_REPORT"     cmd_report ;;
-  -h|--help|help) usage; exit 0 ;;
   *) echo "Subcomando desconocido: $CMD" >&2; usage; exit 1 ;;
 esac
 

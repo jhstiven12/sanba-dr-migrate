@@ -13,7 +13,7 @@ case "$last" in
   *"printf '%s"*)          printf 'sanba\037clave\037sanba\037'; exit 0 ;;
   *"has_table_privilege"*) [[ "$last" == *"psql -U postgres"* ]] && exit 0 || { echo "service_catalog.seq_x  [secuencia]"; exit 0; } ;;
   *"SELECT 1;"*)           [[ "$last" == *"psql -U postgres"* ]] && { echo 1; exit 0; } || exit 0 ;;
-  *"count(*) FROM information_schema.tables"*) echo 0; exit 0 ;;
+  *"count(*) FROM information_schema.tables"*) echo "${MOCK_DB_TABLES:-0}"; exit 0 ;;
   *"query_to_xml"*)        printf 'public.clientes 120\npublic.movimientos 4500\n'; exit 0 ;;
   *"pg_dump"*|*"pg_restore"*|*"mkdir -p"*|*"rm -rf"*) exit 0 ;;
 esac
@@ -66,6 +66,14 @@ if [[ "$ALL" == *"get configmap,secret,deployment"* ]]; then
     sanba-core-dr)         echo '{"items":[{"kind":"ConfigMap","metadata":{"name":"sanba-core-config"},"data":{"LOC_URL":"http://config.location-resources-dr.svc/api","GUI":"http://sanba-gui.sanba-gui-dr.svc:8080"}}]}' ;;
     sanba-gui-dr)          echo '{"items":[{"kind":"Deployment","metadata":{"name":"sanba-gui"},"spec":{"template":{"spec":{"containers":[{"name":"web","env":[{"name":"API","value":"http://sanba-core.sanba-core-dr.svc:8080"}]}]}}}}]}' ;;
     *)                     echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
+if [[ "$ALL" == *"get deployment,deploymentconfig,statefulset -o json"* ]]; then
+  case "$ns" in
+    sanba-core-dr) echo '{"items":[{"kind":"Deployment","metadata":{"name":"sanba-core"}},{"kind":"DeploymentConfig","metadata":{"name":"sanba-core-batch"}}]}' ;;
+    sanba-gui-dr)  echo '{"items":[{"kind":"Deployment","metadata":{"name":"sanba-gui"}}]}' ;;
+    *)             echo '{"items":[]}' ;;
   esac
   exit 0
 fi

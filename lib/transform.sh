@@ -286,9 +286,10 @@ def keep:
     # OpenShift crea estos RoleBindings solo en cada namespace nuevo. Copiar el
     # 'admin' de producción daría permisos de administrador sobre el namespace de
     # contingencia a los dueños del proyecto de producción.
+    # OpenShift numera estos bindings cuando hay más de uno: system:image-puller-0
     (\$keeprb == "true")
-    or (.metadata.name | IN("admin","system:deployers","system:image-builders",
-                            "system:image-pullers","system:image-puller") | not)
+    or (.metadata.name
+        | test("^(admin|system:(deployers?|image-builders?|image-pullers?)(-[0-9]+)?)\$") | not)
   else true end;
 
 { apiVersion: "v1", kind: "List",
@@ -450,21 +451,61 @@ tf_cluster_bindings() {
 
   # ClusterRoleBindings normales: se renombran con el sufijo de DR para no pisar
   # bindings preexistentes del clúster de pre-producción.
+  #
+  # El export recoge todo ClusterRoleBinding que tenga AL MENOS UN subject en
+  # nuestros namespaces, y esos bindings suelen ser de ámbito de clúster: el de
+  # openshift-pipelines, por ejemplo, lista la ServiceAccount 'pipeline' de
+  # decenas de namespaces. Copiarlo tal cual a pre-producción concedería
+  # permisos de clúster a namespaces que no tienen nada que ver con el drill.
+  # Por eso aquí se hacen dos cosas:
+  #
+  #   1. Se descartan los bindings con ownerReferences: son de un operador, que
+  #      los recrea por su cuenta en pre-producción.
+  #   2. De los demás solo se conservan los subjects que están en NUESTROS
+  #      namespaces. El resto se descarta y se informa.
   if [[ -r "$RAW/_cluster/clusterrolebinding.json" ]] \
      && [[ "$(jq '.items | length' < "$RAW/_cluster/clusterrolebinding.json")" != "0" ]]; then
+
+    local crb_name crb_owner
+    while IFS=$'\t' read -r crb_name crb_owner; do
+      [[ -z "${crb_name:-}" ]] && continue
+      warn "ClusterRoleBinding/$crb_name lo gestiona el operador '$crb_owner': no se copia"
+      todo "ClusterRoleBinding/$crb_name es propiedad de '$crb_owner'. El operador debe estar instalado en pre-producción; él recreará el binding."
+    done < <(jq -r '.items[] | select((.metadata.ownerReferences // []) | length > 0)
+                    | [.metadata.name, (.metadata.ownerReferences[0].kind + "/" + .metadata.ownerReferences[0].name)] | @tsv' \
+             < "$RAW/_cluster/clusterrolebinding.json")
+
+    local dropped
+    while IFS=$'\t' read -r crb_name dropped; do
+      [[ -z "${crb_name:-}" || "${dropped:-0}" == "0" ]] && continue
+      log "  ClusterRoleBinding/$crb_name: se descartan $dropped subjects de namespaces ajenos a la migración"
+    done < <(jq -r --argjson m "$nsmap" '
+        .items[] | select((.metadata.ownerReferences // []) | length == 0)
+        | [ .metadata.name,
+            ([ (.subjects // [])[] | select((.kind != "ServiceAccount") or ($m[.namespace] == null)) ] | length | tostring)
+          ] | @tsv' < "$RAW/_cluster/clusterrolebinding.json")
+
     jq --argjson m "$nsmap" --arg sfx "$DR_SUFFIX" '
       { apiVersion:"v1", kind:"List", items:
         [ .items[]
+          # los de un operador se quedan fuera: los recrea él en pre-producción
+          | select((.metadata.ownerReferences // []) | length == 0)
+          # solo los subjects de los namespaces que estamos migrando
+          | ([ (.subjects // [])[]
+               | select(.kind == "ServiceAccount")
+               | select($m[.namespace] != null)
+               | .namespace = $m[.namespace] ]) as $subs
+          | select($subs | length > 0)
           | del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp,
                 .metadata.managedFields, .metadata.selfLink, .metadata.ownerReferences, .status)
           | .metadata.name = (.metadata.name + $sfx)
-          | (if .subjects then .subjects |= map(
-               if .kind == "ServiceAccount" and .namespace then .namespace = ($m[.namespace] // .namespace) else . end)
-             else . end)
-          | (if .userNames then del(.userNames) else . end)
+          | .subjects = $subs
+          | del(.userNames, .groupNames)
         ] }' < "$RAW/_cluster/clusterrolebinding.json" \
       | to_manifest > "$CLEAN/_cluster/80-clusterrolebinding.$MANIFEST_EXT"
-    log "  ClusterRoleBindings renombrados con sufijo ${DR_SUFFIX} en 80-clusterrolebinding.$MANIFEST_EXT"
+
+    local kept; kept=$(read_manifest "$CLEAN/_cluster/80-clusterrolebinding.$MANIFEST_EXT" | jq '.items | length')
+    log "  ClusterRoleBindings copiados con sufijo ${DR_SUFFIX}: $kept (solo con subjects de los namespaces migrados)"
   fi
   ok "Bindings preparados"
 }
@@ -804,35 +845,49 @@ tf_cross_refs() {
     printf '%s\n' "-------------------------------------------------------------------------------------------------------------------------------------"
   } >> "$out"
 
-  local origen
+  # Un subject puede estar en tres sitios distintos, y solo uno es un error:
+  #   - en un namespace de PRODUCCIÓN que SÍ migramos -> se quedó sin traducir
+  #   - en su equivalente -dr                          -> correcto
+  #   - en un namespace ajeno a la migración           -> permiso a otra
+  #     aplicación del clúster; no lo podemos traducir y no es un fallo nuestro,
+  #     pero hay que revisarlo porque ese namespace puede no existir en
+  #     pre-producción.
+  local ajenos=0
   for s in $(src_namespaces); do
     d="$(ns_dst "$s")"
-    while IFS=$'\t' read -r origen bind sa sans; do
+    while IFS=$'\t' read -r bind sa sans; do
       [[ -z "${sa:-}" ]] && continue
+      [[ -z "$sans" ]] && sans="$d"     # sin namespace = el del propio binding
       local estado="OK"
-      if [[ -z "$sans" ]]; then
-        sans="$d"                       # sin namespace = el del propio binding
-      fi
-      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+      if is_src_ns "$sans"; then
         estado="SIN TRADUCIR (SA de PRODUCCIÓN)"
-        err "$origen $bind concede permisos a la ServiceAccount '$sa' del namespace de PRODUCCIÓN '$sans'"
-        todo "$origen: el binding '$bind' apunta a la SA '$sa' en '$sans'. Debe apuntar a '$(ns_dst "$sans")'."
+        err "$d rolebinding/$bind concede permisos a la SA '$sa' del namespace de PRODUCCIÓN '$sans'"
+        todo "$d: el RoleBinding '$bind' apunta a la SA '$sa' en '$sans'. Debe apuntar a '$(ns_dst "$sans")'."
         bad=$((bad+1))
+      elif ! is_dst_ns "$sans"; then
+        estado="EXTERNO a la migración"
+        ajenos=$((ajenos+1))
+        vlog "$d: $bind concede acceso a '$sa' de '$sans', ajeno a la migración"
       elif ! awk -F'\t' -v n="$sans" -v x="$sa" '$1==n && $2==x {f=1} END{exit !f}' "$sas_file"; then
         estado="SERVICEACCOUNT INEXISTENTE"
-        err "$origen $bind concede permisos a '$sa', que no existirá en $sans"
-        todo "$origen: el binding '$bind' apunta a la ServiceAccount '$sa' de '$sans', que no se migra. El permiso quedaría sin efecto."
+        err "$d rolebinding/$bind concede permisos a '$sa', que no existirá en $sans"
+        todo "$d: el RoleBinding '$bind' apunta a la ServiceAccount '$sa' de '$sans', que no se migra. El permiso quedaría sin efecto."
         bad=$((bad+1))
       elif [[ "$sans" != "$d" ]]; then
         estado="CRUZADO (correcto)"
         vlog "$d: $bind concede acceso a $sa de $sans"
       fi
       printf '%-26s %-30s %-22s %-30s %s\n' "$d" "$bind" "$sa" "$sans" "$estado" >> "$out"
-    done < <(clean_items "$d" rolebinding | jq -r --arg d "$d" '
+    done < <(clean_items "$d" rolebinding | jq -r '
       .[] | .metadata.name as $n | ((.subjects // [])[])
       | select(.kind == "ServiceAccount")
-      | [("RoleBinding " + $d + "/"), $n, .name, (.namespace // "")] | @tsv')
+      | [$n, .name, (.namespace // "")] | @tsv')
   done
+
+  if (( ajenos > 0 )); then
+    warn "$ajenos concesiones apuntan a ServiceAccounts de namespaces ajenos a la migración (marcadas EXTERNO en el informe)"
+    todo "Revisa las $ajenos concesiones marcadas EXTERNO en $out: dan permisos a ServiceAccounts de otras aplicaciones. Comprueba si esos namespaces existen en pre-producción; si no, el binding queda sin efecto."
+  fi
 
   # ClusterRoleBindings: viven fuera de los namespaces, pero sus subjects no.
   local crb
@@ -840,11 +895,13 @@ tf_cross_refs() {
     while IFS=$'\t' read -r bind sa sans; do
       [[ -z "${sa:-}" ]] && continue
       local estado="CRUZADO (correcto)"
-      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+      if is_src_ns "$sans"; then
         estado="SIN TRADUCIR (SA de PRODUCCIÓN)"
         err "ClusterRoleBinding/$bind concede permisos de clúster a la SA '$sa' del namespace de PRODUCCIÓN '$sans'"
         todo "ClusterRoleBinding/$bind: la SA '$sa' sigue en '$sans'. Debe ser '$(ns_dst "$sans")'."
         bad=$((bad+1))
+      elif ! is_dst_ns "$sans"; then
+        estado="EXTERNO a la migración"
       elif ! awk -F'\t' -v n="$sans" -v x="$sa" '$1==n && $2==x {f=1} END{exit !f}' "$sas_file"; then
         estado="SERVICEACCOUNT INEXISTENTE"
         err "ClusterRoleBinding/$bind concede permisos a '$sa', que no existirá en $sans"
@@ -909,7 +966,7 @@ tf_report_default_rolebindings() {
       fi
     done < <(jq -r '
       .items[]
-      | select(.metadata.name | IN("admin","system:deployers","system:image-builders","system:image-pullers","system:image-puller"))
+      | select(.metadata.name | test("^(admin|system:(deployers?|image-builders?|image-pullers?)(-[0-9]+)?)$"))
       | [ .metadata.name,
           ([ (.subjects // [])[] | (.kind // "?") + "/" + (.name // "?") ] | join(",")) ] | @tsv' \
       < "$RAW/$s/rolebinding.json" 2>/dev/null)

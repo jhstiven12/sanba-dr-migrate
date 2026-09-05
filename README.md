@@ -31,24 +31,37 @@ menú con las tareas del plan. Cada opción llama por debajo a
 `sanba-dr-migrate.sh`, que es quien hace el trabajo.
 
 ```
- PROD (origen)  https://api.prod:6443                    usuario: dr-operator
- DR (destino)   https://api.preprod:6443                 usuario: dr-operator
- NAMESPACES     location-resources sanba-data-persistence sanba-core sanba-gui  sufijo: -dr
- CORRIDA        20260904-181500                          modo: escritura
 ==============================================================================
-  PREPARACIÓN
-    1) Preflight — host, sesiones, permisos, namespaces y StorageClasses
-    2) Export    — extraer producción a out/<corrida>/raw  (SOLO LECTURA)
-    3) Transform — sanear, renombrar namespaces y reescribir las URLs
-    4) Revisar informes de la corrida
-
-  DESPLIEGUE EN CONTINGENCIA
-    5) Mirror    — copiar las imágenes por digest al registry de pre-producción
-    6) Apply     — desplegar en pre-producción (encadena la carga de datos)
-    7) Db-migrate— cargar los datos PostgreSQL por separado
-    8) Validate  — comprobar rollouts, pods, PVCs, URLs, BD, SA y configuración
-  ...
+ SANBA · CONSOLA DE CONTINGENCIA (DR)          2026-09-04 19:28:05
+==============================================================================
+ ● PROD (origen)  https://api.prod:6443       dr-operator  [solo lectura]
+ ● DR (destino)   https://api.preprod:6443    dr-operator  [escritura]
+   CORRIDA        20260904-190133              modo: escritura
+   NAMESPACES     location-resources sanba-data-persistence ...  ->  sufijo -dr
+------------------------------------------------------------------------------
+ SECUENCIA DEL DRILL  sigue el orden: cada paso da por hecho el anterior
+   ✔   1  Preflight   host, sesiones, permisos, namespaces y almacenamiento
+   ✔   2  Export      extrae produccion a out/<corrida>/raw (solo lectura)
+   ✔   3  Transform   sanea, renombra namespaces y reescribe las URLs
+   ▸   4  Revisar     informes y pendientes ANTES de tocar pre-produccion  <-- siguiente
+       5  Mirror      copia las imagenes por digest al registry de DR
+       6  Apply       despliega los manifiestos, SIN datos
+       7  Datos       pg_dump en PROD -> pg_restore en contingencia
+       8  Reiniciar   los workloads que arrancaron contra la base vacia
+       9  Validate    rollouts, pods, PVCs, URLs, BD, SA y configuracion
+------------------------------------------------------------------------------
+ ACCIONES
+   T  Todo de una vez (1 a 9)        U  URLs de los componentes
+   B  Rollback: borra el DR          O  Opciones de ejecucion
+   S  Sesiones: reautenticar         Q  Salir
+==============================================================================
 ```
+
+**Los números son el orden.** La consola marca en verde lo que ya está hecho en
+la corrida actual y señala en amarillo el paso que toca; las acciones que se
+salen de la secuencia (rollback, informes, opciones) usan letras para que la
+numeración no mienta. Los pasos 7 y 8 son la base de datos y el reinicio
+posterior: el despliegue ya no carga datos por su cuenta.
 
 El token se pide con el eco apagado y admite pegar la línea completa que da la
 consola web (*tu usuario → Copy login command*): la consola extrae el token y la
@@ -358,7 +371,25 @@ location-resources-dr  core-can-read  sanba-core-sa  sanba-core-dr  CRUZADO (cor
 
 Cada dependencia se marca como `OK`, `SIN TRADUCIR (apunta a PRODUCCIÓN)` o
 `SERVICE INEXISTENTE`; las dos últimas salen como `FAIL` en la traza y como
-pendiente en `manual-todo.txt`. `validate` repite la comprobación contra el
+pendiente en `manual-todo.txt`.
+
+**Lo que pertenece a otras aplicaciones no es un fallo.** Un RoleBinding de
+`location-resources` puede conceder lectura a la ServiceAccount de otra
+aplicación del clúster (`gts-core`, `scf-common`…). Ese namespace no se migra, no
+hay nada que traducir y el binding se marca `EXTERNO a la migración`: un aviso
+agregado, no un fallo por línea. Lo único que hay que revisar es si ese namespace
+existe también en pre-producción.
+
+**ClusterRoleBindings de ámbito de clúster.** El export recoge todo
+ClusterRoleBinding que tenga *al menos un* subject en nuestros namespaces, y ahí
+entran bindings de operador que listan ServiceAccounts de medio clúster (el de
+openshift-pipelines es el caso típico). Copiarlos tal cual concedería permisos de
+clúster en pre-producción a namespaces ajenos al drill, así que:
+
+- los que tienen `ownerReferences` **no se copian**: son de un operador, que los
+  recrea por su cuenta en pre-producción (queda anotado en `manual-todo.txt`);
+- de los demás solo se conservan los subjects de los namespaces migrados, y si no
+  queda ninguno, el binding se descarta. `validate` repite la comprobación contra el
 clúster, exigiendo además que el Service tenga **endpoints** —es decir, que
 haya algún pod detrás.
 
@@ -438,11 +469,11 @@ Dentro de cada uno: ServiceAccounts → SCC → Roles y RoleBindings → Secrets
 ConfigMaps → PVCs (espera a `Bound`) → Services → workloads (espera al rollout)
 → Routes → NetworkPolicies, HPA y PDB.
 
-La carga de la base de datos se encadena **justo después** de que PostgreSQL esté
-listo y **antes** de que arranque `sanba-core`, para que el backend no se
-encuentre un esquema vacío. Con `--no-db` se omite.
+`apply` **no carga datos**: la base de datos es una fase aparte, con su propio
+subcomando y su propia ventana de ejecución. Con `--with-db` se recupera el
+comportamiento antiguo (restaurar entre PostgreSQL y el backend).
 
-## Paso 8 — Cargar los datos (si lo hiciste por separado)
+## Paso 8 — Cargar los datos
 
 ```bash
 ./sanba-dr-migrate.sh db-migrate
@@ -451,8 +482,42 @@ encuentre un esquema vacío. Con `--no-db` se omite.
 `pg_dump -Fc` en producción → descarga con `oc rsync` → `pg_restore` en
 contingencia → comparación exacta del número de filas por tabla.
 
-Si la base de datos de pre-producción ya tiene tablas, el script se detiene sin
-tocar nada y te ofrece las opciones.
+**Si la base de datos de contingencia ya tiene datos**, el script no restaura
+encima: pregunta si quieres **recargarla** con el corte de producción que acaba
+de descargar. Escribiendo `recargar` se ejecuta `pg_restore --clean --if-exists`,
+que borra los objetos de la base de datos de *pre-producción* antes de restaurar;
+cualquier otra respuesta cancela. En producción no se toca nada en ninguno de los
+dos casos.
+
+Sin terminal detrás (cron, CI) no pregunta: aborta y explica las opciones, para
+que nadie borre una base de datos sin haberlo pedido. Ahí la autorización se da
+por bandera:
+
+```bash
+./sanba-dr-migrate.sh db-migrate --reload-db
+```
+
+O de forma permanente con `DB_RESTORE_CLEAN="true"` en `sanba-dr.env`, que
+recarga siempre sin preguntar.
+
+Después de una recarga hay que repetir el paso 8b: los workloads siguen
+conectados contra los datos anteriores. La consola lo tiene en cuenta y vuelve a
+marcar los pasos 8 y 9 como pendientes.
+
+## Paso 8b — Reiniciar lo que arrancó sin datos
+
+```bash
+./sanba-dr-migrate.sh restart
+```
+
+Al separar el despliegue de la carga, el backend arranca contra una base vacía:
+cachés frías, pools de conexión creados contra un esquema que aún no existía y,
+según la aplicación, un arranque fallido. Este paso lo reinicia una vez cargados
+los datos y espera a que el rollout termine.
+
+No toca el namespace de la base de datos —acaba de restaurarse—, usa
+`rollout restart` para Deployments y StatefulSets, y `rollout latest` para los
+DeploymentConfig, que no admiten `restart`.
 
 ## Paso 9 — Validar
 
@@ -506,8 +571,17 @@ Cuando ya has hecho una pasada completa y sabes que los informes salen limpios:
 ./sanba-dr-migrate.sh all
 ```
 
+Encadena las siete fases en el único orden que funciona:
+
+```
+preflight -> export -> transform -> apply -> db-migrate -> restart -> validate
+                                      |          |           |
+                         despliega sin datos   carga     reinicia lo que
+                                                         arrancó vacío
+```
+
 Se detiene antes de aplicar si `manual-todo.txt` tiene entradas (`--force` para
-continuar igualmente).
+continuar igualmente). Con `--no-db` se saltan las dos fases de datos.
 
 Opciones útiles: `--run <ID>` reutiliza una corrida anterior, `--only <ns>` la
 limita a un namespace, `--dry-run` no escribe en el destino, `-v` da más detalle.
@@ -694,7 +768,9 @@ definidas, y errores que solo aparecen al ejecutar una fase entera.
 bash tests/smoke.sh        # exit 0 si todo pasa
 ```
 
-Comprueba sintaxis, que todas las funciones invocadas existen, el pipeline con
+Comprueba sintaxis, que todas las funciones invocadas existen, la separación de
+la carga de datos, el reinicio posterior, la recarga de una base de datos que ya
+tiene datos, el pipeline con
 manifiestos YAML y JSON, la reescritura de URLs en ConfigMaps, Secrets y
 variables de entorno (incluido que el binario de un Secret no se corrompe y que
 una URL sin equivalente se marca como pendiente), la asociación entre namespaces

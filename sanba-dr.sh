@@ -212,6 +212,15 @@ ejecutar() {
   # las siguientes tareas del menú operen sobre la misma.
   [[ -z "$OPT_RUN" ]] && OPT_RUN="$(ultima_corrida)"
 
+  # Marca de avance: el menú la usa para señalar qué está hecho y cuál es el
+  # siguiente paso de la secuencia.
+  if (( rc == 0 )); then
+    marcar_hecho "$cmd"
+    # Cargar (o recargar) datos invalida lo que venía después: los workloads
+    # siguen contra la base anterior y la validación ya no vale.
+    [[ "$cmd" == "db-migrate" ]] && desmarcar restart validate
+  fi
+
   if (( rc == 0 )); then
     ok "'$cmd' terminó correctamente (corrida ${OPT_RUN:-?})"
   else
@@ -223,7 +232,58 @@ ejecutar() {
 
 ultima_corrida() { ls -1 "$ROOT/out" 2>/dev/null | grep -E '^[0-9]{8}-[0-9]{6}$' | sort | tail -1; }
 
+# --- avance del drill dentro de una corrida ---------------------------------
+# Cada tarea terminada deja una marca en out/<corrida>/. El menú las lee para
+# pintar lo hecho, lo pendiente y cuál toca ahora.
+corrida_actual() { printf '%s' "${OPT_RUN:-$(ultima_corrida)}"; }
+
+marcar_desmarcar() {
+  local run k; run="$(corrida_actual)"
+  [[ -n "$run" ]] || return 0
+  for k in "$@"; do rm -f "$ROOT/out/$run/.hecho-$k"; done
+}
+
+hecho() {
+  local run; run="$(corrida_actual)"
+  [[ -n "$run" && -d "$ROOT/out/$run" ]] || return 0
+  : > "$ROOT/out/$run/.hecho-$1"
+}
+
+hecho() {
+  local run; run="$(corrida_actual)"
+  [[ -n "$run" ]] || return 1
+  [[ -f "$ROOT/out/$run/.hecho-$1" ]]
+}
+
+# Secuencia del drill: clave interna y subcomando del motor.
+SECUENCIA=(preflight export transform revisar mirror apply db-migrate restart validate)
+
+# Primera tarea de la secuencia que aún no está hecha.
+siguiente_paso() {
+  local k
+  for k in "${SECUENCIA[@]}"; do
+    hecho "$k" || { printf '%s' "$k"; return 0; }
+  done
+  printf 'validate'
+}
+
 pausa() { local _x; printf '\n'; read -rp "  [Enter] para volver al menú " _x; }
+
+# Guardas del menú: sin sesión no se lanza nada contra los clústeres, y las
+# tareas que escriben piden que se teclee una palabra.
+con_sesion() {
+  sesiones_listas && return 0
+  warn "Necesitas sesión en los dos clústeres (opción S)"
+  pausa
+  return 1
+}
+
+confirmado() {
+  confirmar "$1" "$2" && return 0
+  warn "Cancelado"
+  pausa
+  return 1
+}
 
 confirmar() {
   local pregunta="$1" palabra="$2" r
@@ -329,82 +389,113 @@ menu_opciones() {
 # =============================================================================
 #  Menú principal
 # =============================================================================
+# --- una línea de la secuencia ----------------------------------------------
+# paso_linea <nº> <clave> <nombre> <descripción>
+paso_linea() {
+  local num="$1" clave="$2" nombre="$3" desc="$4"
+  local marca ncol dcol sufijo=""
+  if hecho "$clave"; then
+    marca="${C_GRN}✔${C_RST}"; ncol="$C_DIM"; dcol="$C_DIM"
+  elif [[ "$clave" == "$SIGUIENTE" ]]; then
+    marca="${C_YEL}▸${C_RST}"; ncol="${C_BLD}${C_YEL}"; dcol="$C_YEL"
+    sufijo="   ${C_YEL}<-- siguiente${C_RST}"
+  else
+    marca=" "; ncol="$C_BLD"; dcol="$C_DIM"
+  fi
+  printf '   %s  %s%2s%s  %s%-11s%s %s%-46s%s%s\n' \
+    "$marca" "$ncol" "$num" "$C_RST" "$C_BLD" "$nombre" "$C_RST" "$dcol" "$desc" "$C_RST" "$sufijo" >&2
+}
+
+# --- una acción fuera de la secuencia ---------------------------------------
+accion() { printf '   %s%s%s  %-28s' "${C_CYA}${C_BLD}" "$1" "$C_RST" "$2" >&2; }
+
+barra() { printf '%s%s%s\n' "${1:-$C_CYA}" "$(_rule "${2:-=}")" "$C_RST" >&2; }
+
 cabecera() {
-  local modo="escritura"; [[ "$OPT_DRY_RUN" == true ]] && modo="SIMULACIÓN (--dry-run)"
-  printf '\n%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
-  printf ' %sSANBA · CONSOLA DE CONTINGENCIA (DR)%s   %s\n' "$C_BLD" "$C_RST" "$(_now)"
-  printf '%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
-  # Etiquetas sin acentos: printf pad'ea por bytes, y una tilde desalinearía
-  # la columna en el terminal.
-  printf ' %-14s %-40s %s\n' "PROD (origen)" "${SRC_SERVER:-sin sesion}" "${SRC_USER:+usuario: $SRC_USER}"
-  printf ' %-14s %-40s %s\n' "DR (destino)"  "${DST_SERVER:-sin sesion}" "${DST_USER:+usuario: $DST_USER}"
-  printf ' %-14s %-40s %s\n' "NAMESPACES"    "$NS_ORDER" "sufijo: $DR_SUFFIX"
-  printf ' %-14s %-40s %s\n' "CORRIDA"       "${OPT_RUN:-nueva / la ultima}" "modo: $modo"
-  printf '%s%s%s\n' "$C_CYA" "$(_rule '=')" "$C_RST"
+  local modo="${C_GRN}escritura${C_RST}"
+  [[ "$OPT_DRY_RUN" == true ]] && modo="${C_YEL}SIMULACION (--dry-run)${C_RST}"
+  local pdot ddot
+  [[ -n "$SRC_SERVER" ]] && pdot="${C_GRN}●${C_RST}" || pdot="${C_RED}○${C_RST}"
+  [[ -n "$DST_SERVER" ]] && ddot="${C_GRN}●${C_RST}" || ddot="${C_RED}○${C_RST}"
+  # La corrida efectiva: la fijada a mano, o la última que exista.
+  local run="$OPT_RUN" etiqueta=""
+  if [[ -z "$run" ]]; then
+    run="$(ultima_corrida)"
+    [[ -n "$run" ]] && etiqueta="  ${C_DIM}(la ultima)${C_RST}" || run="ninguna todavia"
+  fi
+
+  printf '\n' >&2
+  barra "$C_CYA" "="
+  printf ' %sSANBA · CONSOLA DE CONTINGENCIA (DR)%s%s   %s%s\n' \
+    "${C_BLD}${C_CYA}" "$C_RST" "$C_DIM" "$(_now)" "$C_RST" >&2
+  barra "$C_CYA" "="
+  # Etiquetas sin acentos: printf pad'ea por bytes y una tilde desalinearía.
+  printf ' %s %-14s %s%-38s%s %s\n' "$pdot" "PROD (origen)" "$C_BLD" \
+    "${SRC_SERVER:-sin sesion}" "$C_RST" "${C_DIM}${SRC_USER:-}  [solo lectura]${C_RST}" >&2
+  printf ' %s %-14s %s%-38s%s %s\n' "$ddot" "DR (destino)" "$C_BLD" \
+    "${DST_SERVER:-sin sesion}" "$C_RST" "${C_DIM}${DST_USER:-}  [escritura]${C_RST}" >&2
+  printf '   %-14s %s%-38s%s %s%s\n' "CORRIDA" "$C_BLD" \
+    "$run" "$C_RST" "modo: $modo" "$etiqueta" >&2
+  printf '   %-14s %s%s\n' "NAMESPACES" "${C_DIM}$NS_ORDER  ->  sufijo $DR_SUFFIX" "$C_RST" >&2
 }
 
 menu() {
+  SIGUIENTE="$(siguiente_paso)"
   cabecera
-  cat <<'MENU'
-  PREPARACIÓN
-    1) Preflight — host, sesiones, permisos, namespaces y StorageClasses
-    2) Export    — extraer producción a out/<corrida>/raw  (SOLO LECTURA)
-    3) Transform — sanear, renombrar namespaces y reescribir las URLs
-    4) Revisar informes de la corrida
-
-  DESPLIEGUE EN CONTINGENCIA
-    5) Mirror    — copiar las imágenes por digest al registry de pre-producción
-    6) Apply     — desplegar en pre-producción (encadena la carga de datos)
-    7) Db-migrate— cargar los datos PostgreSQL por separado
-    8) Validate  — comprobar rollouts, pods, PVCs, URLs, BD, SA y configuración
-
-  FLUJOS
-    9) Todo de una vez (preflight -> export -> transform -> apply -> validate)
-   10) Rollback  — borrar el entorno de contingencia para repetir el drill
-
-  UTILIDADES
-   11) URLs de los componentes (mapa, informe y ficheros de mapeo)
-   12) Opciones de ejecución (dry-run, verbose, corrida, namespace)
-   13) Volver a autenticarse en los clústeres
-    0) Salir
-MENU
+  barra "$C_DIM" "-"
+  printf ' %sSECUENCIA DEL DRILL%s  %ssigue el orden: cada paso da por hecho el anterior%s\n' \
+    "${C_BLD}${C_CYA}" "$C_RST" "$C_DIM" "$C_RST" >&2
+  paso_linea 1 preflight  "Preflight"  "host, sesiones, permisos, namespaces y almacenamiento"
+  paso_linea 2 export     "Export"     "extrae produccion a out/<corrida>/raw (solo lectura)"
+  paso_linea 3 transform  "Transform"  "sanea, renombra namespaces y reescribe las URLs"
+  paso_linea 4 revisar    "Revisar"    "informes y pendientes ANTES de tocar pre-produccion"
+  paso_linea 5 mirror     "Mirror"     "copia las imagenes por digest al registry de DR"
+  paso_linea 6 apply      "Apply"      "despliega los manifiestos, SIN datos"
+  paso_linea 7 db-migrate "Datos"      "carga los datos; si ya los hay, pregunta si recargar"
+  paso_linea 8 restart    "Reiniciar"  "los workloads que arrancaron contra la base vacia"
+  paso_linea 9 validate   "Validate"   "rollouts, pods, PVCs, URLs, BD, SA y configuracion"
+  barra "$C_DIM" "-"
+  printf ' %sACCIONES%s\n' "${C_BLD}${C_CYA}" "$C_RST" >&2
+  accion "T" "Todo de una vez (1 a 9)";  accion "U" "URLs de los componentes"; printf '\n' >&2
+  accion "B" "Rollback: borra el DR";    accion "O" "Opciones de ejecucion";   printf '\n' >&2
+  accion "S" "Sesiones: reautenticar";   accion "Q" "Salir";                   printf '\n' >&2
+  barra "$C_CYA" "="
 }
 
 principal() {
   establecer_sesiones || warn "Sin sesiones válidas solo podrás usar las utilidades del menú"
 
+  local o
   while true; do
     menu
-    local o; read -rp "  Tarea: " o
-    case "$o" in
-      1)  sesiones_listas && ejecutar preflight  || { warn "Necesitas sesión en los dos clústeres"; pausa; } ;;
-      2)  sesiones_listas && ejecutar export     || { warn "Necesitas sesión en los dos clústeres"; pausa; } ;;
+    read -rp "  Tarea (numero o letra): " o
+    case "${o,,}" in
+      1)  con_sesion && ejecutar preflight ;;
+      2)  con_sesion && ejecutar export ;;
       3)  ejecutar transform ;;
-      4)  menu_informes ;;
-      5)  sesiones_listas && ejecutar mirror     || { warn "Necesitas sesión en los dos clústeres"; pausa; } ;;
-      6)  if ! sesiones_listas; then warn "Necesitas sesión en los dos clústeres"; pausa
-          elif confirmar "Se va a ESCRIBIR en $DST_SERVER (namespaces $NS_ORDER con sufijo $DR_SUFFIX)." "aplicar"; then
-            ejecutar apply
-          else warn "Cancelado"; pausa; fi ;;
-      7)  if ! sesiones_listas; then warn "Necesitas sesión en los dos clústeres"; pausa
-          elif confirmar "Se hará pg_dump en PRODUCCIÓN (solo lectura) y pg_restore en contingencia." "cargar"; then
-            ejecutar db-migrate
-          else warn "Cancelado"; pausa; fi ;;
-      8)  sesiones_listas && ejecutar validate   || { warn "Necesitas sesión en los dos clústeres"; pausa; } ;;
-      9)  if ! sesiones_listas; then warn "Necesitas sesión en los dos clústeres"; pausa
-          elif confirmar "Flujo completo: acabará ESCRIBIENDO en $DST_SERVER." "continuar"; then
-            OPT_RUN=""      # 'all' abre siempre una corrida nueva
-            ejecutar all
-          else warn "Cancelado"; pausa; fi ;;
-      10) if ! sesiones_listas; then warn "Necesitas sesión en los dos clústeres"; pausa
-          elif confirmar "Se BORRARÁN los namespaces con sufijo $DR_SUFFIX en $DST_SERVER. Producción no se toca." "borrar"; then
-            ejecutar rollback --confirm
-          else warn "Cancelado"; pausa; fi ;;
-      11) menu_urls ;;
-      12) menu_opciones ;;
-      13) establecer_sesiones || true; pausa ;;
-      0|q|salir) printf '\n'; log "Fin de la sesión de contingencia"; exit 0 ;;
-      *) warn "Opción no válida" ;;
+      4)  menu_informes; marcar_hecho revisar ;;
+      5)  con_sesion && ejecutar mirror ;;
+      6)  con_sesion \
+            && confirmado "Se va a ESCRIBIR en $DST_SERVER (namespaces $NS_ORDER con sufijo $DR_SUFFIX)." "aplicar" \
+            && ejecutar apply ;;
+      7)  con_sesion \
+            && confirmado "pg_dump en PRODUCCIÓN (solo lectura) y pg_restore en contingencia. Si la base de datos de DR ya tiene datos, se te preguntará si recargarla." "cargar" \
+            && ejecutar db-migrate ;;
+      8)  con_sesion \
+            && confirmado "Se reiniciarán los workloads de contingencia (no la base de datos)." "reiniciar" \
+            && ejecutar restart ;;
+      9)  con_sesion && ejecutar validate ;;
+      t)  con_sesion \
+            && confirmado "Flujo completo 1 a 9: acabará ESCRIBIENDO en $DST_SERVER." "continuar" \
+            && { OPT_RUN=""; ejecutar all; } ;;
+      b)  con_sesion \
+            && confirmado "Se BORRARÁN los namespaces con sufijo $DR_SUFFIX en $DST_SERVER. Producción no se toca." "borrar" \
+            && ejecutar rollback --confirm ;;
+      u)  menu_urls ;;
+      o)  menu_opciones ;;
+      s)  establecer_sesiones || true; pausa ;;
+      q|salir|0) printf '\n' >&2; log "Fin de la sesión de contingencia"; exit 0 ;;
+      *)  warn "Opción no válida" ;;
     esac
   done
 }

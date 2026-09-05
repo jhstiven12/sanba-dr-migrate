@@ -123,6 +123,26 @@ grep -q 'SIN TRADUCIR' out/SMOKE/reports/cross-namespace.txt \
 grep -q 'huerfano .* SERVICE INEXISTENTE' out/SMOKE/reports/cross-namespace.txt \
   && ok "detecta la referencia a un Service que no existe" || bad "no detectó el Service inexistente"
 
+# Bindings de ámbito de clúster que el export arrastra por un solo subject
+crb=$(yq -o=json '.' out/SMOKE/clean/_cluster/80-clusterrolebinding.yaml)
+grep -q 'openshift-pipelines-clusterinterceptors' <<< "$crb" \
+  && bad "se copió un ClusterRoleBinding gestionado por un operador" \
+  || ok "no se copian los ClusterRoleBindings de un operador"
+[[ "$(jq -r '[.items[]|select(.metadata.name=="lectores-varios-dr")|.subjects[]|.namespace]|join(",")' <<< "$crb")" \
+   == "sanba-core-dr" ]] \
+  && ok "del ClusterRoleBinding copiado solo quedan los subjects de los namespaces migrados" \
+  || bad "quedan subjects ajenos: $(jq -c '[.items[]|select(.metadata.name=="lectores-varios-dr")|.subjects[]]' <<< "$crb")"
+yq -o=json '.' out/SMOKE/clean/location-resources-dr/14-rolebinding.yaml | grep -q 'system:image-puller-0' \
+  && bad "se migró un RoleBinding autogenerado numerado" \
+  || ok "los RoleBindings autogenerados numerados no se migran"
+grep -q 'gts-core-rb .* gts-core .* EXTERNO' out/SMOKE/reports/cross-namespace.txt \
+  && ok "una SA de otra aplicación se marca EXTERNO, no como fallo" \
+  || bad "no se clasificó como EXTERNO la concesión a otra aplicación"
+salida=$(URL_MAP_FILE=tests/url-map-test.txt ./sanba-dr-migrate.sh transform --run SMOKE 2>&1)
+grep -q "FAIL.*gts-core\|FAIL.*openshift-pipelines" <<< "$salida" \
+  && bad "las referencias ajenas siguen contando como fallo" \
+  || ok "las referencias ajenas ya no generan fallos"
+
 # Validación en caliente (contra el oc simulado)
 salida=$(./sanba-dr-migrate.sh validate --run SMOKE 2>&1)
 grep -q 'config.location-resources-dr.svc resuelve y tiene endpoints' <<< "$salida" \
@@ -155,6 +175,25 @@ grep -q -- '--src-tls-verify=false --dest-tls-verify=false' out/SMOKE/mirror-com
 grep -q -- '--insecure' out/SMOKE/mirror-commands.sh \
   && ok "oc registry login lleva --insecure" || bad "falta --insecure en el login"
 
+head_ "La carga de datos es una fase aparte"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+salida=$(./sanba-dr-migrate.sh apply --run SMOKE 2>&1)
+grep -q 'FASE DB-MIGRATE' <<< "$salida" \
+  && bad "'apply' sigue encadenando la carga de datos" || ok "'apply' ya no carga datos"
+grep -q 'db-migrate --run SMOKE' <<< "$salida" \
+  && ok "'apply' indica cuál es el siguiente paso" || bad "'apply' no indica el siguiente paso"
+salida=$(./sanba-dr-migrate.sh apply --run SMOKE --with-db 2>&1)
+grep -q 'FASE DB-MIGRATE' <<< "$salida" \
+  && ok "--with-db recupera el encadenado" || bad "--with-db no encadena"
+salida=$(./sanba-dr-migrate.sh restart --run SMOKE 2>&1)
+grep -q 'sanba-data-persistence-dr: no se reinicia' <<< "$salida" \
+  && ok "'restart' no toca el namespace de la base de datos" || bad "'restart' reinicia la base de datos"
+grep -q 'rollout latest deploymentconfig/' <<< "$salida" \
+  && ok "los DeploymentConfig se relanzan con 'rollout latest'" || bad "DeploymentConfig mal reiniciado"
+./sanba-dr-migrate.sh --help | grep -q 'apply -> db-migrate -> restart -> validate' \
+  && ok "la ayuda documenta el orden correcto" || bad "la ayuda no documenta el orden"
+
 head_ "db-migrate de extremo a extremo"
 rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
 salida=$(./sanba-dr-migrate.sh db-migrate --run SMOKE 2>&1)
@@ -163,6 +202,26 @@ grep -qi 'syntax error\|orden no encontrada\|command not found' <<< "$salida" \
 grep -q 'Conteo de filas idéntico' <<< "$salida" && ok "dump, restore y verificación" || bad "el flujo de datos no completó"
 grep -q "rol de volcado: postgres-local" <<< "$salida" \
   && ok "escala al superusuario por socket local" || bad "no escaló de rol"
+
+head_ "Recarga de una base de datos que ya tiene datos"
+rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
+salida=$(MOCK_DB_TABLES=42 ./sanba-dr-migrate.sh db-migrate --run SMOKE < /dev/null 2>&1)
+grep -q 'no se autorizó recargarla' <<< "$salida" \
+  && ok "sin autorización no se toca una BD con datos" || bad "recargó sin autorización"
+grep -q -- '--reload-db' <<< "$salida" \
+  && ok "explica cómo recargarla" || bad "no ofrece la recarga"
+salida=$(MOCK_DB_TABLES=42 ./sanba-dr-migrate.sh db-migrate --run SMOKE --reload-db < /dev/null 2>&1)
+grep -q 'se RECARGA la base de datos' <<< "$salida" \
+  && ok "--reload-db recarga sobre los datos existentes" || bad "--reload-db no recargó"
+grep -q 'pg_restore --clean --if-exists' <<< "$salida" \
+  && ok "la recarga usa pg_restore --clean --if-exists" || bad "recarga sin --clean"
+grep -q 'Conteo de filas idéntico' <<< "$salida" \
+  && ok "la recarga termina verificando el conteo de filas" || bad "la recarga no verificó"
+salida=$(MOCK_DB_TABLES=0 ./sanba-dr-migrate.sh db-migrate --run SMOKE < /dev/null 2>&1)
+# El mensaje "(sin --clean, no borra nada)" también contiene la palabra: hay que
+# buscar los flags tal y como se le pasan a pg_restore.
+grep -q -- 'pg_restore --clean --if-exists' <<< "$salida" \
+  && bad "usa --clean con la BD vacía" || ok "con la BD vacía no se pasa --clean"
 
 head_ "El guardarraíl de producción bloquea escrituras"
 for verbo in delete apply scale patch "adm policy"; do

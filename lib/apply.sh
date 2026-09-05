@@ -176,14 +176,16 @@ cmd_apply() {
     [[ -n "${ONLY_NS:-}" && "$ONLY_NS" != "$s" ]] && continue
     apply_namespace "$s"
 
-    # La restauración va justo después de que la BD esté lista y ANTES de que
-    # arranque el backend, para que no encuentre un esquema vacío.
+    # La carga de datos es una fase aparte, con su propio subcomando. Solo se
+    # encadena aquí si se pide expresamente con --with-db, para quien prefiera
+    # el comportamiento antiguo (restaurar entre la BD y el backend).
     #
     # Se ejecuta en una subshell a propósito: si algo falla dentro, un 'die'
     # terminaría el script entero y dejaría el resto de namespaces sin
     # desplegar. Aquí se avisa y se sigue: es preferible un drill completo con
     # la base de datos pendiente que medio entorno sin crear.
-    if [[ "$s" == "$DB_NS" && "$DB_MIGRATE" == true && "${SKIP_DB:-false}" != true && -z "${ONLY_NS:-}" ]]; then
+    if [[ "$s" == "$DB_NS" && "${WITH_DB:-false}" == true && "$DB_MIGRATE" == true \
+          && "${SKIP_DB:-false}" != true && -z "${ONLY_NS:-}" ]]; then
       if ( run_phase DB-MIGRATE "Carga de datos PostgreSQL de PROD a contingencia" cmd_db_migrate ); then
         DB_STEP_OK=true
       else
@@ -199,9 +201,72 @@ cmd_apply() {
   if [[ "${DB_STEP_OK:-true}" != true ]]; then
     warn "Los namespaces están desplegados, pero la base de datos NO se cargó"
     log  "  1) $0 db-migrate --run $RUN_ID"
-    log  "  2) oc -n <namespace-del-backend> rollout restart deployment,deploymentconfig --all"
-    log  "  3) $0 validate --run $RUN_ID"
-  else
+    log  "  2) $0 restart    --run $RUN_ID"
+    log  "  3) $0 validate   --run $RUN_ID"
+  elif [[ "${WITH_DB:-false}" == true ]]; then
     ok "Ejecuta ahora: $0 validate --run $RUN_ID"
+  else
+    log "Los workloads están desplegados. La base de datos aún NO se ha cargado:"
+    log "  1) $0 db-migrate --run $RUN_ID   (pg_dump en PROD -> pg_restore en DR)"
+    log "  2) $0 restart    --run $RUN_ID   (reinicia lo que arrancó contra la base vacía)"
+    log "  3) $0 validate   --run $RUN_ID"
+    ok "Apply completado"
   fi
+}
+
+# =============================================================================
+#  restart — reinicia los workloads que arrancaron antes de que hubiera datos
+#
+#  Al separar la carga de datos del despliegue, el backend arranca contra una
+#  base vacía: cachés frías, pools de conexión creados contra un esquema que aún
+#  no existía y, según la aplicación, un arranque fallido. Este paso los reinicia
+#  una vez cargados los datos. No toca el namespace de la base de datos.
+# =============================================================================
+cmd_restart() {
+  require_cmd oc jq
+  phase_steps "$(src_namespaces | wc -l)"
+
+  local dst_api src_api
+  dst_api=$(oc_dst whoami --show-server 2>/dev/null) || die "Sesión de DESTINO inválida"
+  src_api=$(oc_src whoami --show-server 2>/dev/null) || die "Sesión de ORIGEN inválida"
+  [[ "$dst_api" != "$src_api" ]] || die "ORIGEN y DESTINO son el mismo clúster. Abortando."
+
+  local s d kind name n
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    [[ -n "${ONLY_NS:-}" && "$ONLY_NS" != "$s" ]] && continue
+
+    if [[ "$s" == "$DB_NS" ]]; then
+      step "$d: no se reinicia (es la base de datos que acaba de cargarse)"
+      continue
+    fi
+
+    step "Reiniciando los workloads de $d"
+    [[ "$d" == *"$DR_SUFFIX" ]] || die "El namespace '$d' no termina en '$DR_SUFFIX'. Abortando por seguridad."
+
+    n=0
+    while IFS=$'\t' read -r kind name; do
+      [[ -z "${name:-}" ]] && continue
+      n=$((n+1))
+      if [[ "$kind" == "deploymentconfig" ]]; then
+        # Un DeploymentConfig no admite 'rollout restart'; su equivalente es
+        # lanzar un despliegue nuevo.
+        log "  rollout latest $kind/$name"
+        oc_dstw -n "$d" rollout latest "dc/$name" >/dev/null 2>&1 \
+          || warn "$d: no se pudo relanzar dc/$name (¿hay un despliegue en curso?)"
+      else
+        log "  rollout restart $kind/$name"
+        oc_dstw -n "$d" rollout restart "$kind/$name" >/dev/null \
+          || warn "$d: no se pudo reiniciar $kind/$name"
+      fi
+    done < <(oc_dst -n "$d" get deployment,deploymentconfig,statefulset -o json 2>/dev/null \
+             | jq -r '.items[] | [(.kind | ascii_downcase), .metadata.name] | @tsv')
+
+    if (( n == 0 )); then
+      warn "$d: no hay workloads que reiniciar"
+    else
+      wait_rollouts "$d"
+      ok "$d: $n workloads reiniciados"
+    fi
+  done
 }

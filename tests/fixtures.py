@@ -115,15 +115,42 @@ w(f"{RUN}/raw/{ns}/configmap.json",L([{"apiVersion":"v1","kind":"ConfigMap","met
          "huerfano":"http://inexistente.sanba-core.svc:8080"}}]))
 w(f"{RUN}/raw/{ns}/role.json",L([{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":meta("config-reader",ns),
  "rules":[{"apiGroups":[""],"resources":["configmaps"],"verbs":["get","list"]}]}]))
-w(f"{RUN}/raw/{ns}/rolebinding.json",L([{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":meta("core-can-read",ns),
- "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"config-reader"},
- "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]}]))
+w(f"{RUN}/raw/{ns}/rolebinding.json",L([
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":meta("core-can-read",ns),
+  "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"config-reader"},
+  "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]},
+ # otra aplicación del clúster que también lee esta configuración: no la migramos
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":meta("gts-core-rb",ns),
+  "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"config-reader"},
+  "subjects":[{"kind":"ServiceAccount","name":"gts-core-sa","namespace":"gts-core"}]},
+ # RoleBinding autogenerado por OpenShift, en su variante numerada
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":meta("system:image-puller-0",ns),
+  "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"system:image-puller"},
+  "subjects":[{"kind":"ServiceAccount","name":"default","namespace":"produccion"}]}]))
 json.dump([{"name":"scc-anyuid-core","scc":"anyuid","subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]}],open(f"{RUN}/raw/_cluster/scc-crb.json","w"))
 json.dump([{"scc":"nonroot","users":["system:serviceaccount:sanba-data-persistence:postgresql-sa"]}],open(f"{RUN}/raw/_cluster/scc-users.json","w"))
 json.dump([{"name":"core-scc-restricted","scc":"restricted-v2","subjects":[{"name":"sanba-core-sa","namespace":"sanba-core"}]}],open(f"{RUN}/raw/_cluster/scc-rb.json","w"))
-w(f"{RUN}/raw/_cluster/clusterrolebinding.json",L([{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",
- "metadata":{"name":"sanba-core-cluster-reader","uid":"z"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-reader"},
- "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]}]))
+w(f"{RUN}/raw/_cluster/clusterrolebinding.json",L([
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",
+  "metadata":{"name":"sanba-core-cluster-reader","uid":"z"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-reader"},
+  "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"}]},
+ # Binding de ámbito de clúster que el export recoge porque UNO de sus muchos
+ # subjects está en nuestros namespaces. Es de un operador y lista SAs de medio
+ # clúster: ni se copia, ni sus subjects ajenos deben acabar en contingencia.
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",
+  "metadata":{"name":"openshift-pipelines-clusterinterceptors","uid":"y",
+              "ownerReferences":[{"kind":"TektonConfig","name":"config"}]},
+  "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"openshift-pipelines-clusterinterceptors"},
+  "subjects":[{"kind":"ServiceAccount","name":"pipeline","namespace":n}
+              for n in ["sanba-core","gts-core","scf-common","security","3scale","observability","default"]]},
+ # El mismo caso pero SIN operador detrás: se copia, filtrando los subjects
+ # que no son de los namespaces migrados.
+ {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",
+  "metadata":{"name":"lectores-varios","uid":"x"},
+  "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-reader"},
+  "subjects":[{"kind":"ServiceAccount","name":"sanba-core-sa","namespace":"sanba-core"},
+              {"kind":"ServiceAccount","name":"scf-core-sa","namespace":"scf-core"},
+              {"kind":"User","name":"admin"}]}]))
 open(f"{RUN}/raw/_cluster/custom-resources.txt","w").write("sanba-core\tservicemonitor.monitoring.coreos.com/sanba-core\n")
 
 # --- pods en ejecución, para resolver el digest EXACTO que corre en PROD -----

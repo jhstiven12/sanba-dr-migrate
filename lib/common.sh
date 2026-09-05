@@ -281,6 +281,12 @@ ns_dst() {
 
 src_namespaces() { printf '%s\n' $NS_ORDER; }
 
+# ¿'$1' es uno de los namespaces que se están migrando (nombre de PRODUCCIÓN)?
+is_src_ns() { local n="$1" s; for s in $NS_ORDER; do [[ "$s" == "$n" ]] && return 0; done; return 1; }
+
+# ¿'$1' es el namespace de contingencia de alguno de ellos?
+is_dst_ns() { local n="$1" s; for s in $NS_ORDER; do [[ "$(ns_dst "$s")" == "$n" ]] && return 0; done; return 1; }
+
 # Cadena de gsub (jq / Oniguruma) que reescribe los nombres de namespace dentro
 # de textos: ConfigMaps, Secrets, env vars y URLs internas.
 #

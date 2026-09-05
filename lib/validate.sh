@@ -413,10 +413,14 @@ v_cross_namespace() {
              .captures[0].string, .captures[1].string] | @tsv' | sort -u)
 
     # --- RBAC: ninguna concesión puede seguir apuntando a producción --------
+    # Un subject en un namespace ajeno a la migración no es un fallo nuestro:
+    # es un permiso a otra aplicación del clúster. Se avisa, no se suspende.
     while IFS=$'\t' read -r bind sa sans; do
       [[ -z "${sa:-}" ]] && continue
-      if [[ "$sans" != *"$DR_SUFFIX" ]]; then
+      if is_src_ns "$sans"; then
         vfail "$d rolebinding/$bind concede permisos a la SA '$sa' del namespace de PRODUCCIÓN '$sans'"
+      elif ! is_dst_ns "$sans"; then
+        vwarn "$d rolebinding/$bind concede permisos a '$sa' de '$sans', ajeno a la migración; comprueba que ese namespace existe aquí"
       elif [[ "$sans" != "$d" ]]; then
         if oc_dst -n "$sans" get sa "$sa" >/dev/null 2>&1; then
           vok "$d rolebinding/$bind concede acceso a $sa de $sans (asociación cruzada correcta)"

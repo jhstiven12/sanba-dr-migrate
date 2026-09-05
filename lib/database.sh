@@ -216,6 +216,28 @@ MSG
   die "pg_dump no puede leer todos los objetos con el rol '$PGU'."
 }
 
+# ¿Recargar una base de datos de contingencia que ya tiene datos?
+#
+# Solo pregunta si hay un terminal: en automatización se mantiene el
+# comportamiento de siempre (abortar y explicar las opciones), para que nadie
+# borre una base de datos desde un cron sin haberlo pedido.
+db_pedir_recarga() {
+  local ns="$1" tablas="$2" r
+  [[ -t 0 ]] || return 1
+  [[ "${DRY_RUN:-false}" == true ]] && return 1
+
+  banner "LA BASE DE DATOS DE $ns YA TIENE DATOS ($tablas tablas)" \
+         "Recargarla BORRA sus objetos y restaura de nuevo desde el volcado de producción."
+  {
+    printf '  El volcado de PRODUCCIÓN ya está descargado y es de hace unos segundos.\n'
+    printf '  Recargar equivale a repetir el corte de datos: se pierde lo que haya\n'
+    printf '  ahora en la base de datos de contingencia (solo en contingencia).\n\n'
+    printf '  En PRODUCCIÓN no se toca nada, ni al recargar ni al cancelar.\n\n'
+  } >&2
+  read -rp "  Escribe 'recargar' para actualizar la base de datos, o Enter para cancelar: " r
+  [[ "$r" == "recargar" ]]
+}
+
 cmd_db_migrate() {
   require_cmd oc jq
   [[ "${DB_MIGRATE:-true}" == true ]] || { log "DB_MIGRATE=false, se omite la migración de datos"; return 0; }
@@ -328,11 +350,18 @@ MSG
   db_creds oc_dst "$dst_ns" "$dst_pod"
 
   # No se borra nada sin permiso explícito: si la BD de contingencia ya tiene
-  # tablas, hay que decidir a mano.
+  # tablas, hay que decidir. Se puede decidir de tres formas: con --reload-db,
+  # con DB_RESTORE_CLEAN="true" en la configuración, o contestando a la pregunta
+  # cuando el script corre en un terminal.
   local dst_role; dst_role=$(db_pick_read_role oc_dst "$dst_ns" "$dst_pod")
   local existing; existing=$(db_table_count oc_dst "$dst_ns" "$dst_pod" "$dst_role")
   if [[ "${existing:-0}" -gt 0 && "${DB_RESTORE_CLEAN:-false}" != true ]]; then
-    cat >&2 <<MSG
+    if [[ "${RELOAD_DB:-false}" == true ]] || db_pedir_recarga "$dst_ns" "$existing"; then
+      DB_RESTORE_CLEAN=true
+      warn "$dst_ns ya tenía $existing tablas: se RECARGA la base de datos (pg_restore --clean --if-exists)"
+      todo "$dst_ns: la base de datos se recargó sobre $existing tablas existentes. Reinicia los workloads: $0 restart --run $RUN_ID"
+    else
+      cat >&2 <<MSG
 
   La base de datos de $dst_ns ya contiene $existing tablas.
 
@@ -340,16 +369,19 @@ MSG
   restaurar encima produciría errores de objeto duplicado o datos mezclados.
 
   Opciones:
-    a) Vacía o recrea la base de datos de PRE-PRODUCCIÓN a mano y repite.
-    b) Recrea el namespace:  ./sanba-dr-migrate.sh rollback --confirm
-    c) Si aceptas que pg_restore BORRE los objetos de la BD de pre-producción,
-       pon DB_RESTORE_CLEAN="true" en sanba-dr.env y vuelve a ejecutar
-       './sanba-dr-migrate.sh db-migrate'.
+    a) Recargarla con los datos actuales de producción, borrando antes los
+       objetos que ya tiene la base de datos de PRE-PRODUCCIÓN:
+           ./sanba-dr-migrate.sh db-migrate --reload-db
+       (o la opción 7 de ./sanba-dr.sh, que te lo pregunta)
+    b) Vaciar o recrear la base de datos de PRE-PRODUCCIÓN a mano y repetir.
+    c) Recrear el namespace entero:  ./sanba-dr-migrate.sh rollback --confirm
+    d) Dejarlo fijado en la configuración: DB_RESTORE_CLEAN="true" en sanba-dr.env
 
   En PRODUCCIÓN no se ha tocado nada.
 
 MSG
-    die "La base de datos destino no está vacía y DB_RESTORE_CLEAN=false."
+      die "La base de datos destino no está vacía y no se autorizó recargarla."
+    fi
   fi
 
   log "  subiendo el volcado al pod destino con oc rsync"
