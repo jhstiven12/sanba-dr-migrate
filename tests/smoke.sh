@@ -84,6 +84,34 @@ grep -q "env/PORTAL_URL" out/SMOKE/reports/manual-todo.txt \
 head -1 out/SMOKE/url-map.tsv | grep -q 'sanba-gui-sanba-gui.apps.prod.example.com' \
   && ok "el mapa aplica primero la coincidencia más larga" || bad "el mapa de URLs está mal ordenado"
 
+head_ "Nombres de objeto que se llaman como un namespace"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+salida=$(./sanba-dr-migrate.sh transform --run SMOKE 2>&1)
+grep -q "SPRING_CLOUD_KUBERNETES_CONFIG_NAME' vale 'location-resources'" <<< "$salida" \
+  && ok "avisa de los valores ambiguos" || bad "no detectó el valor ambiguo"
+grep -q 'AMBIGUO' out/SMOKE/reports/ns-rewrites.txt \
+  && ok "el informe marca el valor como AMBIGUO" || bad "el informe no marca la ambigüedad"
+grep -q 'ns-rewrite-skip' out/SMOKE/reports/manual-todo.txt \
+  && ok "manual-todo.txt explica cómo resolverlo" || bad "manual-todo.txt no lo explica"
+cm=$(yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml \
+     | jq -r '.items[]|select(.metadata.name=="bff-config")|.data')
+[[ "$(jq -r .SPRING_CLOUD_KUBERNETES_CONFIG_NAME <<< "$cm")" == "location-resources-dr" ]] \
+  && ok "sin regla, el valor se reescribe (comportamiento por defecto)" || bad "cambió el comportamiento por defecto"
+
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+NS_REWRITE_SKIP_FILE=tests/ns-skip-test.txt ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+cm=$(yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml \
+     | jq -r '.items[]|select(.metadata.name=="bff-config")|.data')
+[[ "$(jq -r .SPRING_CLOUD_KUBERNETES_CONFIG_NAME <<< "$cm")" == "location-resources" ]] \
+  && ok "la regla CLAVE=valor protege el nombre del ConfigMap" \
+  || bad "no se protegió: $(jq -r .SPRING_CLOUD_KUBERNETES_CONFIG_NAME <<< "$cm")"
+[[ "$(jq -r .SPRING_CLOUD_KUBERNETES_CONFIG_NAMESPACE <<< "$cm")" == "location-resources-dr" ]] \
+  && ok "la clave de al lado, con el MISMO valor, sí se reescribe" \
+  || bad "la protección se pasó de largo a otra clave"
+yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml \
+  | jq -r '.items[]|select(.metadata.name=="sanba-core-config")|.data.LOC_URL' | grep -q 'location-resources-dr.svc' \
+  && ok "el resto del renombrado sigue intacto" || bad "la protección rompió el renombrado general"
+
 head_ "Asociación entre namespaces"
 rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
 URL_MAP_FILE=tests/url-map-test.txt ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1

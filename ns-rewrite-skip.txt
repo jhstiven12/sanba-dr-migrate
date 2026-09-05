@@ -1,0 +1,31 @@
+# Valores que el renombrado de namespace NO debe tocar.
+#
+# El renombrado trabaja sobre texto, y hay cadenas indistinguibles de un nombre
+# de namespace que significan otra cosa. El caso típico es el NOMBRE de un
+# ConfigMap o de un Secret que coincide con el de un namespace:
+#
+#   SPRING_CLOUD_KUBERNETES_CONFIG_NAMESPACE: location-resources   <- SÍ reescribir
+#   SPRING_CLOUD_KUBERNETES_CONFIG_NAME:      location-resources   <- NO reescribir
+#
+# Los dos valores son la misma cadena, pero el segundo apunta a un ConfigMap,
+# que en contingencia conserva su nombre. Reescribirlo hace que la aplicación
+# busque 'location-resources-dr', no encuentre sus variables y arranque a medias
+# o entre en CrashLoopBackOff.
+#
+# FORMATO — una regla por línea:
+#
+#   CLAVE=valor    protege ese valor SOLO cuando es el valor de esa clave de un
+#                  ConfigMap o Secret, o de esa variable de entorno. Es la forma
+#                  recomendada: quirúrgica, y distingue las dos claves del
+#                  ejemplo de arriba.
+#   CLAVE=*        protege cualquier valor de esa clave.
+#   valor          protege ese texto aparezca donde aparezca. Úsalo solo cuando
+#                  el valor no deba reescribirse en ningún sitio.
+#
+# Qué poner aquí lo dice el propio script: 'transform' marca como AMBIGUO, en
+# reports/ns-rewrites.txt y en manual-todo.txt, los valores que son exactamente
+# un nombre de namespace y coinciden además con el nombre de un objeto migrado.
+#
+# Ejemplos (borra o adapta):
+# SPRING_CLOUD_KUBERNETES_CONFIG_NAME=location-resources
+# CONFIGMAP_NAME=*

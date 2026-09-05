@@ -1,0 +1,2 @@
+# Solo esta clave lleva el NOMBRE de un ConfigMap; la de al lado sí es un namespace.
+SPRING_CLOUD_KUBERNETES_CONFIG_NAME=location-resources

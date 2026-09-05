@@ -33,6 +33,11 @@ w(f"{RUN}/raw/{ns}/secret.json",L([
    "keystore.p12":base64.b64encode(bytes([0,1,2,255,254,200,180]*4)).decode()}}]))
 w(f"{RUN}/raw/{ns}/configmap.json",L([
  {"apiVersion":"v1","kind":"ConfigMap","metadata":meta("kube-root-ca.crt",ns),"data":{"ca.crt":"PEM"}},
+ # El BFF lee su configuración por la API de Kubernetes: uno de estos valores es
+ # un NAMESPACE (se reescribe) y el otro el NOMBRE de un ConfigMap (no se toca).
+ {"apiVersion":"v1","kind":"ConfigMap","metadata":meta("bff-config",ns),"data":{
+   "SPRING_CLOUD_KUBERNETES_CONFIG_NAMESPACE":"location-resources",
+   "SPRING_CLOUD_KUBERNETES_CONFIG_NAME":"location-resources"}},
  {"apiVersion":"v1","kind":"ConfigMap","metadata":meta("sanba-core-config",ns),"data":{
    "application.yaml":"db:\n  host: postgresql.sanba-data-persistence.svc\ngui: http://sanba-gui.sanba-gui.svc:8080\nlegacy: sanba-core-legacy-app\n",
    "LOC_URL":"http://config.location-resources.svc/api",
@@ -109,7 +114,11 @@ w(f"{RUN}/raw/{ns}/networkpolicy.json",L([
      {"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"sanba-core"}}},
      {"namespaceSelector":{"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In",
                                                 "values":["sanba-gui","sanba-core"]}]}}]}]}}]))
-w(f"{RUN}/raw/{ns}/configmap.json",L([{"apiVersion":"v1","kind":"ConfigMap","metadata":meta("endpoints",ns),
+w(f"{RUN}/raw/{ns}/configmap.json",L([
+ # ConfigMap con el mismo nombre que su namespace: de ahí nace la ambigüedad
+ {"apiVersion":"v1","kind":"ConfigMap","metadata":meta("location-resources",ns),
+  "data":{"TASA_IVA":"19","MONEDA":"COP"}},
+ {"apiVersion":"v1","kind":"ConfigMap","metadata":meta("endpoints",ns),
  "data":{"core":"http://sanba-core.sanba-core.svc:8080","db":"postgresql.sanba-data-persistence.svc",
          # referencia a un Service que no existe: debe detectarse antes de aplicar
          "huerfano":"http://inexistente.sanba-core.svc:8080"}}]))

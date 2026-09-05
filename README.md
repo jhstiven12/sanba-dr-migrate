@@ -276,7 +276,7 @@ los informes en `out/<run>/`.
 | `reports/routes.txt` | Hostname que tendrá cada Route en contingencia. |
 | `reports/serviceaccounts.txt` | Cada SA con sus SCC, su origen y los workloads que la usan. |
 | `reports/config.txt` | ConfigMaps y Secrets, número de claves y quién los consume. |
-| `reports/ns-rewrites.txt` | Qué claves contenían un nombre de namespace y fueron reescritas. |
+| `reports/ns-rewrites.txt` | Qué claves contenían un nombre de namespace, y cuáles son **AMBIGUAS**. |
 | `reports/urls.txt` | Qué URL tiene ahora cada componente y cuáles se quedaron **SIN RESOLVER**. |
 | `reports/cross-namespace.txt` | Quién llama a qué servicio de qué namespace, el RBAC cruzado y los selectores de red. |
 
@@ -323,6 +323,45 @@ de verdad quedó **desplegado en el clúster** de contingencia.
 
 Desde la consola, la opción **11) URLs de los componentes** enseña el mapa y el
 informe, y abre `url-map.txt` para editarlo.
+
+### Cuando un objeto se llama igual que un namespace
+
+El renombrado trabaja sobre texto y hay cadenas que son indistinguibles de un
+nombre de namespace pero significan otra cosa. El caso que más duele:
+
+```yaml
+SPRING_CLOUD_KUBERNETES_CONFIG_NAMESPACE: location-resources   # SÍ hay que reescribir
+SPRING_CLOUD_KUBERNETES_CONFIG_NAME:      location-resources   # NO: es un ConfigMap
+```
+
+El mismo texto en dos claves contiguas. La primera es un namespace y se convierte
+en `location-resources-dr`; la segunda es el **nombre de un ConfigMap**, que en
+contingencia se conserva. Si se reescribe, la aplicación busca un ConfigMap
+`location-resources-dr` dentro de `location-resources-dr`, no lo encuentra, se
+queda sin variables y entra en `CrashLoopBackOff`.
+
+`transform` no puede adivinar cuál es cuál, así que **lo señala**: todo valor que
+sea exactamente un nombre de namespace y coincida además con el nombre de un
+objeto migrado sale marcado como `AMBIGUO` en `reports/ns-rewrites.txt` y en
+`manual-todo.txt`, con el objeto que provoca la coincidencia.
+
+La decisión se declara en `ns-rewrite-skip.txt`, una regla por línea:
+
+| Regla | Qué protege |
+|---|---|
+| `CLAVE=valor` | ese valor **solo** bajo esa clave de ConfigMap/Secret o esa variable de entorno |
+| `CLAVE=*` | cualquier valor de esa clave |
+| `valor` | ese texto aparezca donde aparezca |
+
+```
+# ns-rewrite-skip.txt
+SPRING_CLOUD_KUBERNETES_CONFIG_NAME=location-resources
+```
+
+La forma `CLAVE=valor` es la recomendada porque distingue las dos claves del
+ejemplo. Lo protegido se sustituye por un centinela antes de aplicar ninguna
+regla y se restaura al final, así que no lo toca ni el mapa de URLs ni el
+renombrado.
 
 ### Asociación entre los namespaces
 
@@ -814,6 +853,7 @@ sanba-dr.sh              consola interactiva: pide los tokens y ofrece el menú 
 sanba-dr-migrate.sh      orquestador
 sanba-dr.env             parámetros
 url-map.txt              sustituciones de URL para los ConfigMaps y Secrets
+ns-rewrite-skip.txt      valores que el renombrado de namespace no debe tocar
 route-map.txt            mapeo opcional de hosts custom
 lib/                     common, preflight, export, transform, images, apply, database, validate
 tests/                   smoke.sh, mock-oc y fixtures.py (pruebas sin clúster)

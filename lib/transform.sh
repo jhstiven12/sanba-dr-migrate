@@ -127,6 +127,49 @@ build_url_map() {
   ok "$total sustituciones de URL activas (mapa en $RUN/url-map.tsv)"
 }
 
+# Valores que NO deben tocarse, leídos de ns-rewrite-skip.txt.
+#
+# El renombrado de namespace trabaja sobre texto, y hay cadenas que son
+# indistinguibles de un nombre de namespace pero significan otra cosa: el NOMBRE
+# de un ConfigMap, de un Secret o de una aplicación. Un valor como
+#   SPRING_CLOUD_KUBERNETES_CONFIG_NAME: location-resources
+# apunta a un ConfigMap, no a un namespace: reescribirlo a
+# 'location-resources-dr' hace que la aplicación busque un objeto que no existe.
+# Este fichero es la lista de esas excepciones.
+# Dos formatos por línea:
+#   <valor>            -> se protege ese texto aparezca donde aparezca
+#   <CLAVE>=<valor>    -> solo cuando es el valor de esa clave (o de esa
+#                         variable de entorno); <CLAVE>=* protege cualquier valor
+_skip_lines() {
+  local f="$ROOT/${NS_REWRITE_SKIP_FILE:-ns-rewrite-skip.txt}" line
+  [[ -r "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" || "$line" == \#* ]] && continue
+    printf '%s\n' "$line"
+  done < "$f"
+}
+
+# Literales protegidos en cualquier sitio (líneas sin '=').
+protect_json() {
+  local out='[]' line
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] && continue
+    out=$(jq -c --arg v "$line" '. + [$v]' <<< "$out")
+  done < <(_skip_lines)
+  printf '%s' "$out"
+}
+
+# Protecciones acotadas a una clave (líneas 'CLAVE=valor').
+skipkv_json() {
+  local out='[]' line
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    out=$(jq -c --arg k "${line%%=*}" --arg v "${line#*=}" '. + [{key:$k, value:$v}]' <<< "$out")
+  done < <(_skip_lines)
+  printf '%s' "$out"
+}
+
 # El mapa como array JSON ordenado, listo para --argjson.
 url_map_json() {
   [[ -s "$RUN/url-map.tsv" ]] || { printf '[]'; return 0; }
@@ -144,9 +187,29 @@ build_jq_program() {
 def rewrite_urls:
   reduce \$urlmap[] as \$m (.; split(\$m.from) | join(\$m.to));
 
+# Los valores de ns-rewrite-skip.txt se sustituyen por un centinela antes de
+# reescribir nada y se restauran al final: así ninguna regla puede tocarlos.
+# \u0001 no aparece en configuración de texto.
+def proteger:
+  reduce range(0; (\$protect | length)) as \$i
+    (.; split(\$protect[\$i]) | join("\u0001" + (\$i | tostring) + "\u0001"));
+def desproteger:
+  reduce range(0; (\$protect | length)) as \$i
+    (.; split("\u0001" + (\$i | tostring) + "\u0001") | join(\$protect[\$i]));
+
 # Primero las URLs externas, después el renombrado de namespace: al revés, el
 # renombrado partiría hosts como sanba-gui-sanba-gui.apps... por la mitad.
-def rewrite_text: if type == "string" then (rewrite_urls | ${gsub_chain}) else . end;
+def rewrite_text:
+  if type == "string" then (proteger | rewrite_urls | ${gsub_chain} | desproteger) else . end;
+
+# Protección acotada a una clave: el mismo texto puede ser un namespace en una
+# variable y el nombre de un ConfigMap en la de al lado.
+def protegido(\$k; \$v):
+  ([ \$skipkv[] | select((.key == \$k) and ((.value == "*") or (.value == \$v))) ] | length) > 0;
+
+def rewrite_kv(\$k):
+  . as \$v
+  | if (\$k != null) and (type == "string") and protegido(\$k; \$v) then \$v else rewrite_text end;
 
 # Reescribe un valor base64 solo si decodifica a texto UTF-8 que round-trippea
 # (así nunca corrompemos claves privadas, keystores ni binarios) y solo si
@@ -175,6 +238,12 @@ def fix_nssel:
             else . end))
     else . end);
 
+def rewrite_b64_kv(\$k):
+  . as \$orig
+  | ((try (\$orig | @base64d) catch null)) as \$d
+  | if (\$d != null) and ((\$d | @base64) == \$orig) and (\$k != null) and protegido(\$k; \$d)
+    then \$orig else rewrite_b64 end;
+
 def sanitize:
   del(.metadata.uid, .metadata.resourceVersion, .metadata.generation,
       .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields,
@@ -194,7 +263,7 @@ def sanitize:
      else .metadata.annotations |= with_entries(.value |= rewrite_text) end);
 
 def fix_container:
-    (if .env      then .env      |= map(if has("value") then .value |= rewrite_text else . end) else . end)
+    (if .env      then .env      |= map(if has("value") then (.name as \$n | .value = (.value | rewrite_kv(\$n))) else . end) else . end)
   | (if .args     then .args     |= map(rewrite_text) else . end)
   | (if .command  then .command  |= map(rewrite_text) else . end);
 
@@ -225,11 +294,11 @@ def perkind:
        else . end)
 
   elif .kind == "Secret" then
-      (if .data       then .data       |= with_entries(.value |= rewrite_b64)  else . end)
-    | (if .stringData then .stringData |= with_entries(.value |= rewrite_text) else . end)
+      (if .data       then .data       |= with_entries(.key as \$k | .value = (.value | rewrite_b64_kv(\$k))) else . end)
+    | (if .stringData then .stringData |= with_entries(.key as \$k | .value = (.value | rewrite_kv(\$k)))     else . end)
 
   elif .kind == "ConfigMap" then
-      (if .data then .data |= with_entries(.value |= rewrite_text) else . end)
+      (if .data then .data |= with_entries(.key as \$k | .value = (.value | rewrite_kv(\$k))) else . end)
 
   elif (.kind == "RoleBinding") or (.kind == "ClusterRoleBinding") then
       (if .subjects then
@@ -332,9 +401,9 @@ tf_namespaces() {
 tf_namespaced() {
   local s d kind in out prog n
   prog="$(build_jq_program)"
-  local nsmap scmap routemap nsre srcdom dstdom urlmap
+  local nsmap scmap routemap nsre srcdom dstdom urlmap protect skipkv
   nsmap="$(ns_map_json)"; scmap="$(sc_map_json)"; routemap="$(route_map_json)"
-  urlmap="$(url_map_json)"
+  urlmap="$(url_map_json)"; protect="$(protect_json)"; skipkv="$(skipkv_json)"
   nsre="$(ns_match_regex)"
   srcdom="$(cat "$RUN/domain-src.txt")"; dstdom="$(cat "$RUN/domain-dst.txt")"
 
@@ -348,7 +417,7 @@ tf_namespaced() {
       out="$CLEAN/$d/$(kind_order "$kind")-$(kind_file "$kind").$MANIFEST_EXT"
       jq --arg dstns "$d" --arg srcns "$s" \
          --argjson nsmap "$nsmap" --argjson scmap "$scmap" --argjson routemap "$routemap" \
-         --argjson urlmap "$urlmap" \
+         --argjson urlmap "$urlmap" --argjson protect "$protect" --argjson skipkv "$skipkv" \
          --arg nsre "$nsre" --arg srcdom "$srcdom" --arg dstdom "$dstdom" \
          --arg tlsmode "$ROUTE_TLS_STRATEGY" --arg custom "$ROUTE_CUSTOM_STRATEGY" \
          --arg keeprb "${MIGRATE_DEFAULT_ROLEBINDINGS:-false}" \
@@ -399,6 +468,72 @@ tf_report_rewrites() {
       done
   done
   log "  $changed claves contenían un nombre de namespace y fueron reescritas"
+
+  # --- valores AMBIGUOS ------------------------------------------------------
+  # Un valor que es EXACTAMENTE el nombre de un namespace puede significar dos
+  # cosas: el namespace (hay que reescribirlo) o el nombre de un objeto que se
+  # llama igual (no hay que tocarlo, porque los objetos conservan su nombre).
+  # Si existe un objeto migrado con ese nombre, la ambigüedad es real y la tiene
+  # que resolver una persona.
+  local objetos="$RUN/.objetos-por-ns.tsv"; : > "$objetos"
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    clean_items "$d" | jq -r --arg d "$d" '.[] | [$d, .kind, .metadata.name] | @tsv' >> "$objetos"
+  done
+
+  local nsre_exact ambiguos=0 valor coincide
+  nsre_exact="^($(printf '%s' "$NS_ORDER" | tr ' ' '|'))\$"
+  {
+    echo
+    echo "Valores que son EXACTAMENTE un nombre de namespace."
+    echo "AMBIGUO = existe además un objeto migrado con ese mismo nombre: comprueba si el"
+    echo "valor se refiere al namespace (correcto reescribirlo) o al objeto (hay que"
+    echo "protegerlo en ${NS_REWRITE_SKIP_FILE:-ns-rewrite-skip.txt})."
+    echo
+    printf '%-26s %-34s %-34s %-20s %s\n' "NAMESPACE(DR)" "OBJETO" "CLAVE" "VALOR" "ESTADO"
+    printf '%s\n' "----------------------------------------------------------------------------------------------------------------------------"
+  } >> "$REPORTS/ns-rewrites.txt"
+
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    while IFS=$'\t' read -r kind name key valor; do
+      [[ -z "${valor:-}" ]] && continue
+      coincide=$(awk -F'\t' -v x="$valor" '$3==x {printf "%s%s/%s", sep, $1, $2; sep=","}' "$objetos")
+      if [[ -n "$coincide" ]]; then
+        ambiguos=$((ambiguos+1))
+        printf '%-26s %-34s %-34s %-20s %s\n' "$d" "$kind/$name" "$key" "$valor" "AMBIGUO -> $coincide" \
+          >> "$REPORTS/ns-rewrites.txt"
+        warn "$d: $kind/$name clave '$key' vale '$valor', que también es el nombre de un objeto ($coincide)"
+        todo "$d: $kind/$name clave '$key' vale '$valor'. Si se refiere al OBJETO y no al namespace, añádelo a ${NS_REWRITE_SKIP_FILE:-ns-rewrite-skip.txt} y repite 'transform': si no, la aplicación buscará '$(ns_dst "$valor")' y no lo encontrará."
+      else
+        printf '%-26s %-34s %-34s %-20s %s\n' "$d" "$kind/$name" "$key" "$valor" "namespace" \
+          >> "$REPORTS/ns-rewrites.txt"
+      fi
+    done < <(
+      for kind in configmap secret; do
+        [[ -r "$RAW/$s/$kind.json" ]] || continue
+        jq -r --arg re "$nsre_exact" --arg k "$kind" '
+          .items[] | .metadata.name as $n
+          | ((.data // {}) | to_entries[]) | . as $e
+          | (if $k == "secret" then ((try ($e.value | @base64d) catch "") // "") else ($e.value // "") end) as $v
+          | select($v | test($re))
+          | [$k, $n, $e.key, $v] | @tsv' < "$RAW/$s/$kind.json" 2>/dev/null
+      done
+      for kind in deployment deploymentconfig statefulset daemonset cronjob; do
+        [[ -r "$RAW/$s/$kind.json" ]] || continue
+        jq -r --arg re "$nsre_exact" --arg k "$kind" '
+          .items[] | .metadata.name as $n
+          | ((.spec.template.spec // .spec.jobTemplate.spec.template.spec // {})) as $ps
+          | (($ps.containers // []) + ($ps.initContainers // []))[]
+          | ((.env // [])[] | select(has("value")))
+          | select(.value | test($re))
+          | [$k, $n, ("env/" + .name), .value] | @tsv' < "$RAW/$s/$kind.json" 2>/dev/null
+      done | sort -u)
+  done
+
+  if (( ambiguos > 0 )); then
+    warn "$ambiguos valores son ambiguos: revisa la segunda tabla de $REPORTS/ns-rewrites.txt"
+  fi
   ok "Detalle en $REPORTS/ns-rewrites.txt"
 }
 
