@@ -505,7 +505,13 @@ tf_cluster_bindings() {
       | to_manifest > "$CLEAN/_cluster/80-clusterrolebinding.$MANIFEST_EXT"
 
     local kept; kept=$(read_manifest "$CLEAN/_cluster/80-clusterrolebinding.$MANIFEST_EXT" | jq '.items | length')
-    log "  ClusterRoleBindings copiados con sufijo ${DR_SUFFIX}: $kept (solo con subjects de los namespaces migrados)"
+    if [[ "$kept" == "0" ]]; then
+      # Sin manifiesto: una List vacía haría fallar a 'oc apply' en la fase apply.
+      rm -f "$CLEAN/_cluster/80-clusterrolebinding.$MANIFEST_EXT"
+      log "  Ningún ClusterRoleBinding que copiar: todos son de un operador o no tienen subjects en los namespaces migrados"
+    else
+      log "  ClusterRoleBindings copiados con sufijo ${DR_SUFFIX}: $kept (solo con subjects de los namespaces migrados)"
+    fi
   fi
   ok "Bindings preparados"
 }

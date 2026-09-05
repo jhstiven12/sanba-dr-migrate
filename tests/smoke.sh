@@ -175,6 +175,26 @@ grep -q -- '--src-tls-verify=false --dest-tls-verify=false' out/SMOKE/mirror-com
 grep -q -- '--insecure' out/SMOKE/mirror-commands.sh \
   && ok "oc registry login lleva --insecure" || bad "falta --insecure en el login"
 
+head_ "Manifiestos sin objetos"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+# Si el único ClusterRoleBinding del export es de un operador, no queda nada que
+# copiar: escribir una List vacía haría fallar 'oc apply' en la fase apply.
+jq '{apiVersion,kind,items:[.items[]|select(.metadata.ownerReferences)]}' \
+   out/SMOKE/raw/_cluster/clusterrolebinding.json > out/SMOKE/raw/_cluster/crb.tmp
+cat out/SMOKE/raw/_cluster/crb.tmp > out/SMOKE/raw/_cluster/clusterrolebinding.json
+rm -f out/SMOKE/raw/_cluster/crb.tmp
+./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1
+[[ "$(ls out/SMOKE/clean/_cluster/ | grep -c clusterrolebinding)" == "0" ]] \
+  && ok "no se genera un manifiesto de ClusterRoleBindings vacío" \
+  || bad "se generó una List vacía de ClusterRoleBindings"
+# Y una corrida antigua que ya la tenga tampoco debe romper el apply
+printf '{"apiVersion":"v1","kind":"List","items":[]}\n' > out/SMOKE/clean/_cluster/80-clusterrolebinding.json
+salida=$(./sanba-dr-migrate.sh apply --run SMOKE -v 2>&1)
+grep -q 'se omite 80-clusterrolebinding.json' <<< "$salida" \
+  && ok "'apply' salta los manifiestos sin objetos" || bad "'apply' no saltó la List vacía"
+grep -q 'FASE APPLY  COMPLETADA' <<< "$salida" \
+  && ok "el apply termina bien pese a la List vacía" || bad "el apply falló con la List vacía"
+
 head_ "La carga de datos es una fase aparte"
 rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
 ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1

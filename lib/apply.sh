@@ -6,6 +6,17 @@
 apply_file() {
   local f="$1"
   [[ -r "$f" ]] || return 0
+
+  # Una List sin objetos hace fallar a 'oc apply' con "no objects passed to
+  # apply". Puede quedar así legítimamente: por ejemplo, si todos los
+  # ClusterRoleBindings del export resultaron ser de un operador y ninguno se
+  # copia. No es un error, no hay nada que aplicar.
+  if [[ "$(read_manifest "$f" 2>/dev/null \
+           | jq -r 'if (.kind == "List") then (.items | length) else 1 end' 2>/dev/null)" == "0" ]]; then
+    vlog "  (se omite $(basename "$f"): no contiene ningún objeto)"
+    return 0
+  fi
+
   log "  apply $(basename "$f")"
   oc_dstw apply -f "$f" >/dev/null || die "Falló 'oc apply -f $f'"
 }
