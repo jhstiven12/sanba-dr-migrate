@@ -243,6 +243,33 @@ salida=$(MOCK_DB_TABLES=0 ./sanba-dr-migrate.sh db-migrate --run SMOKE < /dev/nu
 grep -q -- 'pg_restore --clean --if-exists' <<< "$salida" \
   && bad "usa --clean con la BD vacía" || ok "con la BD vacía no se pasa --clean"
 
+head_ "Errores de pg_restore: ruido del catálogo vs problema real"
+rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
+cmdlog=$(mktemp)
+MOCK_CMDLOG="$cmdlog" ./sanba-dr-migrate.sh db-migrate --run SMOKE >/dev/null 2>&1
+grep -q "EXTENSION - plpgsql" "$cmdlog" && grep -q 'SCHEMA - public' "$cmdlog" \
+  && ok "el TOC excluye plpgsql y el esquema public" || bad "no se filtra el TOC"
+grep -q 'LFLAG="-L' "$cmdlog" \
+  && ok "pg_restore se invoca con el TOC filtrado (-L)" || bad "pg_restore no usa -L"
+rm -f "$cmdlog"
+
+rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
+salida=$(MOCK_RESTORE=benigno ./sanba-dr-migrate.sh db-migrate --run SMOKE 2>&1)
+grep -q 'ningún error afecta a los datos' <<< "$salida" \
+  && ok "los errores de propiedad del catálogo no se presentan como fallo" \
+  || bad "un error benigno se presenta como fallo"
+grep -q 'Conteo de filas idéntico' <<< "$salida" \
+  && ok "el flujo continúa hasta la verificación de filas" || bad "el flujo se cortó"
+
+rm -rf out/SMOKE; mkdir -p out/SMOKE/reports out/SMOKE/db
+salida=$(MOCK_RESTORE=real ./sanba-dr-migrate.sh db-migrate --run SMOKE 2>&1)
+grep -q 'errores relevantes' <<< "$salida" \
+  && ok "un error real sí se destaca" || bad "no se destacó el error real"
+grep -q 'invalid input syntax' <<< "$salida" \
+  && ok "se muestra la línea del error real" || bad "no se muestra el error real"
+grep -q 'pg_restore reportó' out/SMOKE/reports/manual-todo.txt \
+  && ok "el error real llega a manual-todo.txt" || bad "el error real no llega a manual-todo.txt"
+
 head_ "El guardarraíl de producción bloquea escrituras"
 for verbo in delete apply scale patch "adm policy"; do
   salida=$(bash -c 'source ./sanba-dr.env; source lib/common.sh; oc_src '"$verbo"' x 2>&1' || true)

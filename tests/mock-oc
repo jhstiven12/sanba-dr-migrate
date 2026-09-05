@@ -15,7 +15,33 @@ case "$last" in
   *"SELECT 1;"*)           [[ "$last" == *"psql -U postgres"* ]] && { echo 1; exit 0; } || exit 0 ;;
   *"count(*) FROM information_schema.tables"*) echo "${MOCK_DB_TABLES:-0}"; exit 0 ;;
   *"query_to_xml"*)        printf 'public.clientes 120\npublic.movimientos 4500\n'; exit 0 ;;
-  *"pg_dump"*|*"pg_restore"*|*"mkdir -p"*|*"rm -rf"*) exit 0 ;;
+  *"pg_restore"*)
+     # Traza opcional del comando recibido, para que las pruebas puedan
+     # comprobar cómo se invoca a pg_restore.
+     [[ -n "${MOCK_CMDLOG:-}" ]] && printf '%s\n' "$last" >> "$MOCK_CMDLOG"
+     case "${MOCK_RESTORE:-}" in
+       benigno)
+         cat <<'PGERR'
+pg_restore: [archiver (db)] Error while PROCESSING TOC:
+pg_restore: [archiver (db)] Error from TOC entry 1; 3079 12281 EXTENSION plpgsql
+pg_restore: [archiver (db)] could not execute query: ERROR:  must be owner of extension plpgsql
+    Command was: DROP EXTENSION IF EXISTS plpgsql;
+pg_restore: [archiver (db)] Error from TOC entry 3; 2615 2200 SCHEMA public postgres
+pg_restore: [archiver (db)] could not execute query: ERROR:  must be owner of schema public
+    Command was: DROP SCHEMA IF EXISTS public;
+PGERR
+         exit 1 ;;
+       real)
+         cat <<'PGERR'
+pg_restore: [archiver (db)] Error from TOC entry 4211; 0 16599 TABLE DATA movimientos
+pg_restore: [archiver (db)] could not execute query: ERROR:  relation "movimientos" does not exist
+pg_restore: [archiver (db)] Error from TOC entry 4212; 0 16600 TABLE DATA clientes
+pg_restore: [archiver (db)] could not execute query: ERROR:  invalid input syntax for type numeric
+PGERR
+         exit 1 ;;
+     esac
+     exit 0 ;;
+  *"pg_dump"*|*"mkdir -p"*|*"rm -rf"*) exit 0 ;;
 esac
 if [[ "$ALL" == *"rsync"* ]]; then
   for a in "$@"; do [[ "$a" == */ && "$a" != *:* ]] && dest="$a"; done

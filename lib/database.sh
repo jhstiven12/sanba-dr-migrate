@@ -238,6 +238,47 @@ db_pedir_recarga() {
   [[ "$r" == "recargar" ]]
 }
 
+# Distingue el ruido del catálogo de un problema de datos.
+#
+# PostgreSQL 10 escribe "pg_restore: [archiver (db)] Error from TOC entry ..."
+# y las versiones 12+ "pg_restore: error: ...". Se cuentan las dos formas.
+#
+# Son benignos —y no afectan a una sola fila— los errores por no ser dueño de un
+# objeto del sistema y los de objeto ya existente. Cualquier otro se muestra: es
+# lo que hay que mirar. El juez final sigue siendo el conteo de filas.
+#
+# 'does not exist' NO entra aquí a propósito: con --if-exists los DROP ya no lo
+# producen, así que si aparece es que una tabla no llegó a crearse y los datos
+# de esa tabla se han perdido.
+_DB_BENIGNOS='must be owner of (extension|schema)|already exists'
+
+db_informe_restore() {
+  local rc="$1" f="$2" total reales n_reales
+  [[ -r "$f" ]] || { ok "pg_restore sin errores"; return 0; }
+
+  total=$(grep -cE 'Error from TOC entry|^pg_restore: error:' "$f" 2>/dev/null || true)
+  total=${total:-0}
+  reales=$(grep -E 'could not execute query: ERROR|^pg_restore: error:' "$f" 2>/dev/null \
+           | grep -viE "$_DB_BENIGNOS" || true)
+  n_reales=$(grep -c . <<< "${reales:-}" 2>/dev/null || true)
+  [[ -z "${reales:-}" ]] && n_reales=0
+
+  if (( n_reales > 0 )); then
+    warn "pg_restore: $n_reales errores relevantes de $total (rc=$rc). Detalle: $f"
+    head -15 <<< "$reales" | sed 's/^/      /' >&2
+    todo "Revisa $f: pg_restore reportó $n_reales errores que no son de permisos sobre objetos del sistema."
+  elif (( total > 0 )); then
+    log "  $total avisos del catálogo (propiedad de objetos del sistema u objetos ya existentes)"
+    ok "pg_restore completado: ningún error afecta a los datos (traza en $f)"
+  elif (( rc != 0 )); then
+    warn "pg_restore devolvió rc=$rc sin errores reconocibles. Detalle: $f"
+    head -15 "$f" | sed 's/^/      /' >&2
+  else
+    ok "pg_restore sin errores"
+  fi
+  return 0
+}
+
 cmd_db_migrate() {
   require_cmd oc jq
   [[ "${DB_MIGRATE:-true}" == true ]] || { log "DB_MIGRATE=false, se omite la migración de datos"; return 0; }
@@ -397,26 +438,37 @@ MSG
   fi
 
   log "  pg_restore ${clean_flags:-(sin --clean, no borra nada)} — $(du -h "$dump" | cut -f1) de volcado, puede tardar varios minutos sin mostrar salida"
+  log "  se excluyen del TOC 'plpgsql' y el esquema 'public': son de 'postgres' y ya existen en el destino"
+
+  # El TOC del volcado incluye la extensión plpgsql y el esquema public, que
+  # pertenecen al superusuario. Con --clean, pg_restore intenta borrarlos y
+  # falla con "must be owner of extension/schema", y después con "schema public
+  # already exists" al recrearlo. Como ambos existen SIEMPRE en la base de datos
+  # destino, se excluyen del TOC: el restore queda limpio y no se pierde nada.
+  local remote_cmd
+  remote_cmd=$(cat <<REMOTE
+set -u
+DUMP="$DB_REMOTE_DIR/$DB_DUMP_NAME"
+TOC="$DB_REMOTE_DIR/toc.list"
+pg_restore -l "\$DUMP" 2>/dev/null \
+  | grep -vE '(EXTENSION - plpgsql|COMMENT - EXTENSION plpgsql|SCHEMA - public[[:space:]]|COMMENT - SCHEMA public)' \
+  > "\$TOC" || true
+LFLAG=""
+[ -s "\$TOC" ] && LFLAG="-L \$TOC"
+PGPASSWORD="\$POSTGRESQL_PASSWORD" pg_restore -U "\$POSTGRESQL_USER" -d "\$POSTGRESQL_DATABASE" \
+  --no-owner --no-privileges $clean_flags \$LFLAG "\$DUMP"
+REMOTE
+)
+
   local t0=$SECONDS
   set +e
-  oc_dst exec -n "$dst_ns" "$dst_pod" -- bash -c \
-    "PGPASSWORD=\"\$POSTGRESQL_PASSWORD\" pg_restore -U \"\$POSTGRESQL_USER\" -d \"\$POSTGRESQL_DATABASE\" \
-       --no-owner --no-privileges $clean_flags $DB_REMOTE_DIR/$DB_DUMP_NAME" \
-    > "$RUN/db/restore.log" 2>&1
+  oc_dst exec -n "$dst_ns" "$dst_pod" -- bash -c "$remote_cmd" > "$RUN/db/restore.log" 2>&1
   local rc=$?
   set -e
   oc_dst exec -n "$dst_ns" "$dst_pod" -- rm -rf "$DB_REMOTE_DIR" >/dev/null 2>&1 || true
 
   log "  pg_restore terminó en $((SECONDS - t0))s"
-  local errs; errs=$(grep -ci '^pg_restore: error' "$RUN/db/restore.log" 2>/dev/null) || errs=0
-  if (( rc != 0 || errs > 0 )); then
-    # Con --clean son habituales los errores por objetos inexistentes o por no ser
-    # dueño de extensiones del sistema; el juez final es el diff de conteos.
-    warn "pg_restore terminó con $errs errores (rc=$rc). Detalle: $RUN/db/restore.log"
-    sed -n '1,15p' "$RUN/db/restore.log" | sed 's/^/      /' >&2
-  else
-    ok "pg_restore sin errores"
-  fi
+  db_informe_restore "$rc" "$RUN/db/restore.log"
 
   # ======================= verificación =======================
   step "Verificación: conteo de filas origen vs destino"

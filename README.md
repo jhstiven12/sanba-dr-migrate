@@ -504,6 +504,34 @@ Después de una recarga hay que repetir el paso 8b: los workloads siguen
 conectados contra los datos anteriores. La consola lo tiene en cuenta y vuelve a
 marcar los pasos 8 y 9 como pendientes.
 
+### Los errores de `pg_restore` que no son errores
+
+El volcado incluye en su índice la extensión `plpgsql` y el esquema `public`, que
+pertenecen al superusuario. Restaurando como usuario de la aplicación y con
+`--clean`, `pg_restore` intenta borrarlos y falla:
+
+```
+pg_restore: [archiver (db)] could not execute query: ERROR:  must be owner of extension plpgsql
+    Command was: DROP EXTENSION IF EXISTS plpgsql;
+pg_restore: [archiver (db)] could not execute query: ERROR:  must be owner of schema public
+```
+
+Ninguno de los dos afecta a una sola fila: ambos objetos ya existen en la base de
+datos de destino. Por eso el script los evita de raíz —los excluye del índice del
+volcado con `pg_restore -l | grep -v ... | pg_restore -L`— y, si aun así aparecen
+errores, los clasifica:
+
+- **ruido del catálogo** (no ser dueño de un objeto del sistema, objeto que ya
+  existe) → una línea informativa y `pg_restore completado: ningún error afecta a
+  los datos`;
+- **cualquier otro** → aviso destacado con las líneas concretas y entrada en
+  `manual-todo.txt`.
+
+`relation ... does not exist` **no** cuenta como ruido: con `--if-exists` los
+`DROP` ya no lo producen, así que si aparece es que una tabla no llegó a crearse.
+
+El juez final sigue siendo el mismo: `db/rowcounts.diff` vacío.
+
 ## Paso 8b — Reiniciar lo que arrancó sin datos
 
 ```bash
