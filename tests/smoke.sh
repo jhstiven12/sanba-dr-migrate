@@ -112,6 +112,36 @@ yq -o=json '.' out/SMOKE/clean/sanba-core-dr/25-configmap.yaml \
   | jq -r '.items[]|select(.metadata.name=="sanba-core-config")|.data.LOC_URL' | grep -q 'location-resources-dr.svc' \
   && ok "el resto del renombrado sigue intacto" || bad "la protección rompió el renombrado general"
 
+head_ "URLs que se quedan sin esquema"
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+salida=$(./sanba-dr-migrate.sh transform --run SMOKE 2>&1)
+grep -q 'Ninguna URL perdió su esquema' <<< "$salida" \
+  && ok "la transformación verifica que ninguna URL pierde el esquema" \
+  || bad "no se comprueba la integridad de las URLs"
+
+# Una regla de url-map mal escrita que deja el valor sin host
+cat > tests/url-map-roto.txt <<'MAP'
+https://sanba-gui-sanba-gui.apps.prod.example.com    https://
+MAP
+rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
+salida=$(URL_MAP_FILE=tests/url-map-roto.txt ./sanba-dr-migrate.sh transform --run SMOKE 2>&1)
+grep -q 'queda un :// sin host' <<< "$salida" \
+  && ok "detecta una URL que queda sin host" || bad "no detectó la URL rota"
+grep -q 'URL incompleta' <<< "$salida" \
+  && ok "el resumen del paso lo refleja" || bad "el resumen no refleja la URL rota"
+rm -f tests/url-map-roto.txt
+
+head_ "diff-config: qué ve la aplicación frente a producción"
+salida=$(./sanba-dr-migrate.sh diff-config --run SMOKE --only sanba-core 2>&1)
+grep -q "clave 'URL_X': en PRODUCCIÓN es una URL y en contingencia ya no" <<< "$salida" \
+  && ok "señala la clave que perdió el esquema" || bad "no señaló la clave sin esquema"
+grep -q 'PROD: http://sanba-core.sanba-core.svc:8080/api' <<< "$salida" \
+  && ok "muestra el valor de producción y el de contingencia" || bad "no muestra los dos valores"
+grep -q "secret/bff-sec clave 'K' difiere" <<< "$salida" \
+  && ok "de los Secrets dice qué clave difiere" || bad "no compara los Secrets"
+grep -q 'valor-prod\|dmFsb3ItcHJvZA' <<< "$salida" \
+  && bad "imprimió el valor de un Secret" || ok "nunca imprime el valor de un Secret"
+
 head_ "Asociación entre namespaces"
 rm -rf out/SMOKE; python3 tests/fixtures.py out/SMOKE >/dev/null
 URL_MAP_FILE=tests/url-map-test.txt ./sanba-dr-migrate.sh transform --run SMOKE >/dev/null 2>&1

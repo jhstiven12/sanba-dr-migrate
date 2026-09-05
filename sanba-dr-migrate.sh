@@ -57,6 +57,10 @@ SUBCOMANDOS
                contingencia y sus ClusterRoleBindings en PRE-PRODUCCIÓN, para
                poder repetir el drill. Nunca toca producción. Exige --confirm.
   report       Muestra dónde están los informes de una corrida.
+  diff-config  Compara clave a clave la configuración que hay AHORA en
+               producción con la que hay en contingencia. Diagnóstico para un
+               pod que arranca mal. De los Secrets solo dice qué claves
+               difieren, nunca el valor.
 
 INFORMES CLAVE
   reports/manual-todo.txt   lo que hay que resolver a mano
@@ -291,6 +295,7 @@ T_RESTART="Reinicio de los workloads que arrancaron sin datos"
 T_VALIDATE="Validación end-to-end del entorno de contingencia"
 T_ROLLBACK="Borrado del entorno de contingencia (solo pre-producción)"
 T_REPORT="Informes de la corrida"
+T_DIFFCFG="Comparación de la configuración: producción vs contingencia"
 
 EXIT_RC=0
 case "$CMD" in
@@ -304,7 +309,8 @@ case "$CMD" in
   validate)   PHASE_TOTAL=1; run_phase VALIDATE   "$T_VALIDATE"   cmd_validate   || EXIT_RC=$? ;;
   all)        cmd_all || EXIT_RC=$? ;;
   rollback)   PHASE_TOTAL=1; run_phase ROLLBACK   "$T_ROLLBACK"   cmd_rollback ;;
-  report)     PHASE_TOTAL=1; run_phase REPORT     "$T_REPORT"     cmd_report ;;
+  report)      PHASE_TOTAL=1; run_phase REPORT     "$T_REPORT"    cmd_report ;;
+  diff-config) PHASE_TOTAL=1; run_phase DIFF-CONFIG "$T_DIFFCFG"  cmd_diff_config ;;
   *) echo "Subcomando desconocido: $CMD" >&2; usage; exit 1 ;;
 esac
 

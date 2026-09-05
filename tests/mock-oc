@@ -95,6 +95,23 @@ if [[ "$ALL" == *"get configmap,secret,deployment"* ]]; then
   esac
   exit 0
 fi
+# Configuración simulada a los dos lados, para probar 'diff-config'.
+if [[ "$ALL" == *"get configmap -o json"* ]]; then
+  case "$ns" in
+    sanba-core)    echo '{"items":[{"metadata":{"name":"bff-config"},"data":{"URL_X":"http://sanba-core.sanba-core.svc:8080/api","CFG":"location-resources","IGUAL":"1"}}]}' ;;
+    sanba-core-dr) echo '{"items":[{"metadata":{"name":"bff-config"},"data":{"URL_X":"sanba-core.sanba-core-dr.svc:8080/api","CFG":"location-resources-dr","IGUAL":"1"}}]}' ;;
+    *)             echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
+if [[ "$ALL" == *"get secret -o json"* ]]; then
+  case "$ns" in
+    sanba-core)    echo '{"items":[{"metadata":{"name":"bff-sec"},"type":"Opaque","data":{"K":"dmFsb3ItcHJvZA==","IGUAL":"eA=="}}]}' ;;
+    sanba-core-dr) echo '{"items":[{"metadata":{"name":"bff-sec"},"type":"Opaque","data":{"K":"dmFsb3ItZHI=","IGUAL":"eA=="}}]}' ;;
+    *)             echo '{"items":[]}' ;;
+  esac
+  exit 0
+fi
 if [[ "$ALL" == *"get deployment,deploymentconfig,statefulset -o json"* ]]; then
   case "$ns" in
     sanba-core-dr) echo '{"items":[{"kind":"Deployment","metadata":{"name":"sanba-core"}},{"kind":"DeploymentConfig","metadata":{"name":"sanba-core-batch"}}]}' ;;

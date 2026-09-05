@@ -457,6 +457,99 @@ v_cross_namespace() {
   return 0
 }
 
+# =============================================================================
+#  diff-config — qué ve la aplicación en contingencia frente a producción
+#
+#  Diagnóstico para cuando un pod arranca mal por configuración: compara, clave
+#  a clave, los ConfigMaps y Secrets que hay AHORA en producción con los que hay
+#  AHORA en contingencia, y señala lo que difiere.
+#
+#  De los Secrets solo se dice si la clave difiere; su valor no se imprime nunca.
+# =============================================================================
+_recorta() { local v="$1"; ((${#v} > 96)) && printf '%.93s...' "$v" || printf '%s' "$v"; }
+
+cmd_diff_config() {
+  require_cmd oc jq
+  phase_steps "$(src_namespaces | wc -l)"
+  : > "$REPORTS/diff-config.txt"
+
+  local s d src_cm dst_cm src_sec dst_sec
+  for s in $(src_namespaces); do
+    [[ -n "${ONLY_NS:-}" && "$ONLY_NS" != "$s" ]] && continue
+    d="$(ns_dst "$s")"
+    step "Configuración: $s (PRODUCCIÓN) vs $d (contingencia)"
+
+    src_cm=$(oc_src -n "$s" get configmap -o json 2>/dev/null || echo '{"items":[]}')
+    dst_cm=$(oc_dst -n "$d" get configmap -o json 2>/dev/null || echo '{"items":[]}')
+    src_sec=$(oc_src -n "$s" get secret -o json 2>/dev/null || echo '{"items":[]}')
+    dst_sec=$(oc_dst -n "$d" get secret -o json 2>/dev/null || echo '{"items":[]}')
+
+    local name key estado a b n=0
+    while IFS=$'\t' read -r name key estado a b; do
+      [[ -z "${name:-}" ]] && continue
+      n=$((n+1))
+      printf '%s\tconfigmap/%s\t%s\t%s\n' "$d" "$name" "$key" "$estado" >> "$REPORTS/diff-config.txt"
+      case "$estado" in
+        sin-esquema)
+          err "$d cm/$name clave '$key': en PRODUCCIÓN es una URL y en contingencia ya no"
+          printf '        PROD: %s\n        DR  : %s\n' "$(_recorta "$a")" "$(_recorta "$b")" >&2
+          todo "$d: cm/$name clave '$key' perdió el esquema de la URL — causa típica de 'MalformedURLException: no protocol'." ;;
+        solo-prod)
+          warn "$d cm/$name: la clave '$key' está en PRODUCCIÓN y falta en contingencia" ;;
+        solo-dr)
+          vlog "$d cm/$name: la clave '$key' solo existe en contingencia" ;;
+        difiere)
+          log "  cm/$name $key"
+          printf '        PROD: %s\n        DR  : %s\n' "$(_recorta "$a")" "$(_recorta "$b")" >&2 ;;
+      esac
+    done < <(jq -r -n --argjson a "$src_cm" --argjson b "$dst_cm" '
+      def mapa: [ .items[] | select(.metadata.name | IN("kube-root-ca.crt","openshift-service-ca.crt") | not)
+                  | {key: .metadata.name, value: (.data // {})} ] | from_entries;
+      ($a | mapa) as $A | ($b | mapa) as $B
+      | ($A | keys_unsorted[]) as $n
+      | select($B[$n] != null)
+      | (($A[$n] | keys) + ($B[$n] | keys) | unique)[] as $k
+      | ($A[$n][$k]) as $va | ($B[$n][$k]) as $vb
+      | if   $va == null then [$n, $k, "solo-dr", "", ""]
+        elif $vb == null then [$n, $k, "solo-prod", "", ""]
+        elif $va == $vb  then empty
+        elif ($va | test("://")) and (($vb | test("://")) | not)
+                         then [$n, $k, "sin-esquema", $va, $vb]
+        else [$n, $k, "difiere", $va, $vb] end
+      | @tsv')
+
+    # Secrets: solo si la clave difiere. Nunca el valor.
+    while IFS=$'\t' read -r name key estado; do
+      [[ -z "${name:-}" ]] && continue
+      n=$((n+1))
+      printf '%s\tsecret/%s\t%s\t%s\n' "$d" "$name" "$key" "$estado" >> "$REPORTS/diff-config.txt"
+      case "$estado" in
+        solo-prod) warn "$d secret/$name: la clave '$key' está en PRODUCCIÓN y falta en contingencia" ;;
+        difiere)   log "  secret/$name clave '$key' difiere (valor no mostrado)" ;;
+      esac
+    done < <(jq -r -n --argjson a "$src_sec" --argjson b "$dst_sec" '
+      def mapa: [ .items[] | select((.type // "") | IN("kubernetes.io/service-account-token","kubernetes.io/dockercfg") | not)
+                  | {key: .metadata.name, value: (.data // {})} ] | from_entries;
+      ($a | mapa) as $A | ($b | mapa) as $B
+      | ($A | keys_unsorted[]) as $n
+      | select($B[$n] != null)
+      | (($A[$n] | keys) + ($B[$n] | keys) | unique)[] as $k
+      | ($A[$n][$k]) as $va | ($B[$n][$k]) as $vb
+      | if   $va == null then [$n, $k, "solo-dr"]
+        elif $vb == null then [$n, $k, "solo-prod"]
+        elif $va == $vb  then empty
+        else [$n, $k, "difiere"] end
+      | @tsv')
+
+    if (( n == 0 )); then
+      ok "$d: la configuración coincide con producción clave a clave"
+    else
+      log "  $n diferencias en $d (esperables: las que introduce el renombrado)"
+    fi
+  done
+  ok "Detalle en $REPORTS/diff-config.txt"
+}
+
 cmd_validate() {
   require_cmd oc jq curl
   phase_steps 12

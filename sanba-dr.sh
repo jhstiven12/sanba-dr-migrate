@@ -458,6 +458,7 @@ menu() {
   printf ' %sACCIONES%s\n' "${C_BLD}${C_CYA}" "$C_RST" >&2
   accion "T" "Todo de una vez (1 a 9)";  accion "U" "URLs de los componentes"; printf '\n' >&2
   accion "B" "Rollback: borra el DR";    accion "O" "Opciones de ejecucion";   printf '\n' >&2
+  accion "D" "Diff de configuracion";   accion "" "";                            printf '\n' >&2
   accion "S" "Sesiones: reautenticar";   accion "Q" "Salir";                   printf '\n' >&2
   barra "$C_CYA" "="
 }
@@ -491,6 +492,7 @@ principal() {
       b)  con_sesion \
             && confirmado "Se BORRARÁN los namespaces con sufijo $DR_SUFFIX en $DST_SERVER. Producción no se toca." "borrar" \
             && ejecutar rollback --confirm ;;
+      d)  con_sesion && ejecutar diff-config ;;
       u)  menu_urls ;;
       o)  menu_opciones ;;
       s)  establecer_sesiones || true; pausa ;;

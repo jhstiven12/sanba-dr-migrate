@@ -899,7 +899,52 @@ tf_report_urls() {
       | [$k, $n, $e.key, $p] | @tsv')
   done
 
+  # --- integridad de las URLs -----------------------------------------------
+  # Una reescritura nunca debería cambiar el NÚMERO de URLs de un valor ni
+  # dejarlas sin host. Si eso pasa, la aplicación recibe algo como
+  # "http:///api" o un valor a medias, y falla con MalformedURLException:
+  # no protocol. Se compara el valor de PRODUCCIÓN con el resultado.
+  local n_rotas=0
+  for s in $(src_namespaces); do
+    d="$(ns_dst "$s")"
+    for kind in configmap secret; do
+      [[ -r "$RAW/$s/$kind.json" ]] || continue
+      while IFS=$'\t' read -r name key motivo; do
+        [[ -z "${name:-}" ]] && continue
+        err "$d: $kind/$name clave '$key' — $motivo"
+        todo "$d: $kind/$name clave '$key' quedó con una URL incompleta tras la reescritura ($motivo). Compárala con producción antes de aplicar."
+        printf '%-26s %-12s %-32s %-24s %s\n' "$d" "$kind" "$name" "$key" "URL ROTA: $motivo" >> "$REPORTS/urls.txt"
+        n_rotas=$((n_rotas+1))
+      done < <(jq -r --slurpfile limpio <(clean_items "$d" "$kind") --arg kind "$kind" '
+        ($limpio[0] // []) as $cl
+        | ( [ $cl[] | {key: .metadata.name, value: (.data // {})} ] | from_entries ) as $mapa
+        | .items[]
+        | .metadata.name as $n
+        | select($mapa[$n] != null)
+        | ((.data // {}) | to_entries[]) as $e
+        | (if $kind == "secret" then ((try ($e.value | @base64d) catch "") // "") else ($e.value // "") end) as $a
+        | ($mapa[$n][$e.key]) as $craw
+        | select($craw != null)
+        | (if $kind == "secret" then ((try ($craw | @base64d) catch "") // "") else ($craw // "") end) as $b
+        | ([$a | scan("://")] | length) as $na
+        | ([$b | scan("://")] | length) as $nb
+        | if $na != $nb then
+            [$n, $e.key, "en produccion habia \($na) URLs y ahora hay \($nb)"]
+          elif ($b | test("://([/:?#]|$)")) then
+            [$n, $e.key, "queda un :// sin host"]
+          elif (($a | length) > 0) and (($b | length) == 0) then
+            [$n, $e.key, "el valor quedo vacio"]
+          else empty end
+        | @tsv' < "$RAW/$s/$kind.json" 2>/dev/null)
+    done
+  done
+
   log "  sustituciones de URL aplicadas: $n_rw"
+  if (( n_rotas > 0 )); then
+    err "$n_rotas valores quedaron con una URL incompleta"
+  else
+    ok "Ninguna URL perdió su esquema ni su host al reescribirse"
+  fi
   if (( n_left > 0 )); then
     err "$n_left valores siguen apuntando a producción"
   else

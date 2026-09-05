@@ -586,6 +586,37 @@ No toca el namespace de la base de datos —acaba de restaurarse—, usa
 `rollout restart` para Deployments y StatefulSets, y `rollout latest` para los
 DeploymentConfig, que no admiten `restart`.
 
+## Diagnóstico — `diff-config`
+
+Cuando un pod arranca mal por configuración (`MalformedURLException: no
+protocol`, propiedades vacías, `${placeholder}` sin resolver), la pregunta es
+siempre la misma: *¿qué ve la aplicación aquí que no veía en producción?*
+
+```bash
+./sanba-dr-migrate.sh diff-config --only sanba-core
+```
+
+Compara clave a clave los ConfigMaps y Secrets que hay **ahora** en producción
+con los que hay **ahora** en contingencia:
+
+```
+FAIL sanba-core-dr cm/bff-config clave 'URL_X': en PRODUCCIÓN es una URL y en contingencia ya no
+        PROD: http://sanba-core.sanba-core.svc:8080/api
+        DR  : sanba-core.sanba-core-dr.svc:8080/api
+INFO cm/bff-config CFG
+        PROD: location-resources
+        DR  : location-resources-dr
+INFO secret/bff-sec clave 'K' difiere (valor no mostrado)
+```
+
+De los Secrets solo dice **qué clave** difiere; el valor no se imprime nunca.
+Las diferencias esperables son las que introduce el renombrado: si aparece algo
+más, ahí está el problema.
+
+`transform` hace además una comprobación preventiva: si un valor tenía una URL en
+producción y en contingencia ha perdido el esquema, se ha quedado sin host o ha
+cambiado el número de URLs, sale como `FAIL` antes de aplicar nada.
+
 ## Paso 9 — Validar
 
 ```bash
